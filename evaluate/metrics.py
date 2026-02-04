@@ -9,7 +9,7 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from loguru import logger
@@ -235,6 +235,19 @@ class SQLiteStore:
 
 
 @dataclass
+class CostConfig:
+    enabled: bool = False
+    # If pricing is missing for a model, you can set these env vars:
+    #   OPENAI_PRICE_INPUT_PER_1M, OPENAI_PRICE_CACHED_INPUT_PER_1M, OPENAI_PRICE_OUTPUT_PER_1M
+    #
+    # Or provide a JSON table via:
+    #   OPENAI_PRICE_TABLE_JSON='{"gpt-5.2":{"input":1.75,"cached_input":0.18,"output":14.0}}'
+    #
+    # NOTE: This script does NOT fetch pricing from the web. You must keep these aligned
+    # with OpenAI's official pricing page yourself.
+
+
+@dataclass
 class JudgeConfig:
     # Global switch for ALL rationale ordering across ALL blocks
     rationale_first: bool = True
@@ -242,6 +255,7 @@ class JudgeConfig:
     images_first: bool = True
     temperature: float = 0.0
     max_output_tokens: int = 900
+    cost: CostConfig = field(default_factory=lambda: CostConfig(enabled=True))
 
 
 def _obj(properties: Dict[str, Any], required: List[str]) -> Dict[str, Any]:
@@ -260,10 +274,6 @@ def _obj(properties: Dict[str, Any], required: List[str]) -> Dict[str, Any]:
 def _ordered_fields(
     rationale_first: bool, core_fields: List[Tuple[str, Dict[str, Any]]]
 ) -> Tuple[Dict[str, Any], List[str]]:
-    """
-    Build an object properties dict + required list with rationale placed first or last.
-    core_fields: list of (field_name, field_schema) excluding 'rationale'
-    """
     props: Dict[str, Any] = {}
     req: List[str] = []
 
@@ -285,7 +295,6 @@ def _ordered_fields(
 def build_judge_schema(rationale_first: bool) -> Tuple[str, Dict[str, Any]]:
     schema_name = "judge_rationale_first" if rationale_first else "judge_rationale_last"
 
-    # Visual/Text assessment blocks
     vt_props, vt_req = _ordered_fields(
         rationale_first,
         core_fields=[
@@ -294,15 +303,11 @@ def build_judge_schema(rationale_first: bool) -> Tuple[str, Dict[str, Any]]:
         ],
     )
 
-    # Layout block (includes rationale)
     layout_props, layout_req = _ordered_fields(
         rationale_first,
-        core_fields=[
-            ("consistent", {"type": "boolean"}),
-        ],
+        core_fields=[("consistent", {"type": "boolean"})],
     )
 
-    # Emotion classification block (9 labels)
     emo_props, emo_req = _ordered_fields(
         rationale_first,
         core_fields=[
@@ -311,22 +316,20 @@ def build_judge_schema(rationale_first: bool) -> Tuple[str, Dict[str, Any]]:
         ],
     )
 
-    # Shift block
     shift_props, shift_req = _ordered_fields(
         rationale_first,
         core_fields=[
-            ("magnitude_1_5", {"type": "integer", "minimum": 1, "maximum": 5}),
+            ("magnitude_1_5", {"type": "integer", "minimum": 1, "maximum": 5})
         ],
     )
 
-    # Overall quality block
     oq_props, oq_req = _ordered_fields(
         rationale_first,
         core_fields=[
             (
                 "overall_generation_quality_1_5",
                 {"type": "integer", "minimum": 1, "maximum": 5},
-            ),
+            )
         ],
     )
 
@@ -430,9 +433,7 @@ class PromptBuilder:
 
 class InputBuilder:
     @staticmethod
-    def build_user_content(
-        sample: MemeSample, user_text: str, images_first: bool
-    ) -> List[Dict[str, Any]]:
+    def build_image_blocks(sample: MemeSample) -> List[Dict[str, Any]]:
         src_img = {
             "type": "input_image",
             "image_url": image_to_data_url(sample.src_image_path),
@@ -443,15 +444,23 @@ class InputBuilder:
             "image_url": image_to_data_url(sample.gen_image_path),
             "detail": "high",
         }
-
-        images_block = [
+        return [
             {"type": "input_text", "text": "SOURCE image:"},
             src_img,
             {"type": "input_text", "text": "EDITED image:"},
             gen_img,
         ]
-        text_block = [{"type": "input_text", "text": user_text}]
 
+    @staticmethod
+    def build_text_block(user_text: str) -> List[Dict[str, Any]]:
+        return [{"type": "input_text", "text": user_text}]
+
+    @staticmethod
+    def build_user_content(
+        sample: MemeSample, user_text: str, images_first: bool
+    ) -> List[Dict[str, Any]]:
+        images_block = InputBuilder.build_image_blocks(sample)
+        text_block = InputBuilder.build_text_block(user_text)
         return images_block + text_block if images_first else text_block + images_block
 
     @staticmethod
@@ -468,11 +477,6 @@ class InputBuilder:
 
 
 def _post_validate_payload(payload: Dict[str, Any]) -> List[str]:
-    """
-    Best-effort validation beyond JSON schema:
-    - If label != 'other' -> other_emotion should be null
-    - If label == 'other' -> other_emotion should be a non-empty string
-    """
     errs: List[str] = []
     try:
         cls = payload.get("overall_emotion_classification", {})
@@ -491,6 +495,141 @@ def _post_validate_payload(payload: Dict[str, Any]) -> List[str]:
     except Exception as e:
         errs.append(f"post_validate_exception: {type(e).__name__}: {e}")
     return errs
+
+
+# =============================
+# Cost estimation helpers
+# =============================
+
+
+def _coerce_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+def _extract_usage(resp: Any) -> Dict[str, int]:
+    """
+    Best-effort extraction across SDK variants.
+    Returns:
+      input_tokens, output_tokens, cached_input_tokens, reasoning_tokens
+    """
+    usage = getattr(resp, "usage", None)
+    if usage is None:
+        return {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cached_input_tokens": 0,
+            "reasoning_tokens": 0,
+        }
+
+    input_tokens = _coerce_int(getattr(usage, "input_tokens", 0))
+    output_tokens = _coerce_int(getattr(usage, "output_tokens", 0))
+    reasoning_tokens = _coerce_int(getattr(usage, "reasoning_tokens", 0))
+
+    cached_input_tokens = 0
+    # common pattern: usage.input_tokens_details.cached_tokens
+    itd = getattr(usage, "input_tokens_details", None)
+    if itd is not None:
+        cached_input_tokens = _coerce_int(getattr(itd, "cached_tokens", 0))
+        if cached_input_tokens == 0 and isinstance(itd, dict):
+            cached_input_tokens = _coerce_int(itd.get("cached_tokens", 0))
+
+    # some variants might report cached tokens elsewhere; keep best-effort only.
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "reasoning_tokens": reasoning_tokens,
+    }
+
+
+def _load_pricing_table_from_env() -> Dict[str, Dict[str, float]]:
+    """
+    OPENAI_PRICE_TABLE_JSON='{"gpt-5.2":{"input":1.75,"cached_input":0.18,"output":14.0}}'
+    """
+    raw = (os.environ.get("OPENAI_PRICE_TABLE_JSON") or "").strip()
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            out: Dict[str, Dict[str, float]] = {}
+            for k, v in obj.items():
+                if isinstance(v, dict):
+                    out[str(k)] = {
+                        "input": float(v.get("input", 0.0)),
+                        "cached_input": float(v.get("cached_input", 0.0)),
+                        "output": float(v.get("output", 0.0)),
+                        # optional: "reasoning": float(v.get("reasoning", 0.0)),
+                    }
+            return out
+    except Exception:
+        return {}
+    return {}
+
+
+def _get_pricing_for_model(model: str) -> Dict[str, float]:
+    """
+    Prices are USD per 1M tokens.
+    1) try OPENAI_PRICE_TABLE_JSON
+    2) try OPENAI_PRICE_* env vars
+    3) fallback to a safe "unknown" (zeros)
+    """
+    table = _load_pricing_table_from_env()
+    if model in table:
+        return table[model]
+
+    # per-model env override
+    # Example:
+    #   OPENAI_PRICE_INPUT_PER_1M=1.75
+    #   OPENAI_PRICE_CACHED_INPUT_PER_1M=0.18
+    #   OPENAI_PRICE_OUTPUT_PER_1M=14.0
+    try:
+        return {
+            "input": float(os.environ.get("OPENAI_PRICE_INPUT_PER_1M", "0") or "0"),
+            "cached_input": float(
+                os.environ.get("OPENAI_PRICE_CACHED_INPUT_PER_1M", "0") or "0"
+            ),
+            "output": float(os.environ.get("OPENAI_PRICE_OUTPUT_PER_1M", "0") or "0"),
+        }
+    except Exception:
+        return {"input": 0.0, "cached_input": 0.0, "output": 0.0}
+
+
+def estimate_cost_usd(model: str, usage: Dict[str, int]) -> Dict[str, Any]:
+    """
+    Returns a structured cost object.
+    """
+    pricing = _get_pricing_for_model(model)
+    input_tokens = int(usage.get("input_tokens", 0))
+    cached_input_tokens = int(usage.get("cached_input_tokens", 0))
+    output_tokens = int(usage.get("output_tokens", 0))
+    reasoning_tokens = int(usage.get("reasoning_tokens", 0))
+
+    # Typical billing: cached tokens are a subset of input tokens
+    billable_input_tokens = max(0, input_tokens - cached_input_tokens)
+
+    cost = 0.0
+    cost += billable_input_tokens / 1_000_000 * float(pricing.get("input", 0.0))
+    cost += cached_input_tokens / 1_000_000 * float(pricing.get("cached_input", 0.0))
+    cost += output_tokens / 1_000_000 * float(pricing.get("output", 0.0))
+
+    # If your org/account bills reasoning tokens separately, add it here by providing pricing["reasoning"]
+    # cost += reasoning_tokens / 1_000_000 * float(pricing.get("reasoning", 0.0))
+
+    return {
+        "model": model,
+        "pricing_usd_per_1m_tokens": pricing,
+        "usage_tokens": {
+            "input_tokens": input_tokens,
+            "cached_input_tokens": cached_input_tokens,
+            "output_tokens": output_tokens,
+            "reasoning_tokens": reasoning_tokens,
+        },
+        "estimated_cost_usd": cost,
+    }
 
 
 # =============================
@@ -523,7 +662,6 @@ class JudgeClient:
         max_in_flight: int = 8,
         cache: Optional[CacheConfig] = None,
     ):
-        # NOTE: If you suspect your proxy drops images, unset OPENAI_API_BASE to use default.
         self.client = OpenAI(
             api_key=api_key or os.environ.get("OPENAI_API_KEY"),
             base_url=os.environ.get("OPENAI_API_BASE"),
@@ -595,6 +733,7 @@ class JudgeClient:
                 "images_first": cfg.images_first,
                 "temperature": cfg.temperature,
                 "max_output_tokens": cfg.max_output_tokens,
+                "cost_enabled": bool(getattr(cfg.cost, "enabled", False)),
             },
             "sample_id": sample.sample_id,
             "src_emotion": sample.src_emotion,
@@ -614,11 +753,13 @@ class JudgeClient:
         *,
         use_cache: bool = True,
         force_refresh: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        """
+        Returns: (judge_payload, cost_info_or_none)
+        """
         schema_name, schema = build_judge_schema(cfg.rationale_first)
         prompts = PromptBuilder.build_prompts(sample)
 
-        # image hashes
         src_sha = sha256_file(sample.src_image_path)
         gen_sha = sha256_file(sample.gen_image_path)
 
@@ -642,30 +783,36 @@ class JudgeClient:
                     logger.info(
                         "CACHE HIT | sample={} | key={}", sample.sample_id, cache_short
                     )
-                    return cached
+                    # cost for cache-hit is "unknown" unless you store it separately.
+                    cost_info = None
+                    if cfg.cost.enabled:
+                        cost_info = {
+                            "model": self.model,
+                            "cached_result": True,
+                            "note": "cache hit: no API usage tokens available; estimated_cost_usd set to 0.0",
+                            "estimated_cost_usd": 0.0,
+                        }
+                    return cached, cost_info
                 logger.warning(
                     "CACHE ERROR (ignored) | sample={} | key={}",
                     sample.sample_id,
                     cache_short,
                 )
 
-        (
+        if force_refresh:
             logger.warning(
                 "FORCE REFRESH | sample={} | key={}", sample.sample_id, cache_short
             )
-            if force_refresh
-            else logger.info(
+        else:
+            logger.info(
                 "CACHE MISS | sample={} | key={}", sample.sample_id, cache_short
             )
-        )
 
-        # Build input content/messages (encapsulated)
         user_content = InputBuilder.build_user_content(
             sample, prompts.user_text, images_first=cfg.images_first
         )
         messages = InputBuilder.build_messages(prompts.system_prompt, user_content)
 
-        # Lightweight logging to ensure images exist on disk
         try:
             logger.debug(
                 "IMG INFO | sample={} | src_bytes={} | gen_bytes={}",
@@ -683,12 +830,13 @@ class JudgeClient:
             for attempt in range(self.retry.max_retries + 1):
                 try:
                     logger.debug(
-                        "API CALL | sample={} | attempt={}/{} | images_first={} | rationale_first={}",
+                        "API CALL | sample={} | attempt={}/{} | images_first={} | rationale_first={} | cost_enabled={}",
                         sample.sample_id,
                         attempt + 1,
                         self.retry.max_retries + 1,
                         cfg.images_first,
                         cfg.rationale_first,
+                        cfg.cost.enabled,
                     )
 
                     resp = self.client.responses.create(
@@ -722,6 +870,21 @@ class JudgeClient:
                                 post_errs,
                             )
 
+                    # cost estimation (based on usage tokens from this API response)
+                    cost_info: Optional[Dict[str, Any]] = None
+                    if cfg.cost.enabled:
+                        usage = _extract_usage(resp)
+                        cost_info = estimate_cost_usd(self.model, usage)
+                        cost_info["latency_ms"] = latency_ms
+                        logger.info(
+                            "COST | sample={} | input={} | cached_in={} | output={} | est_usd={:.8f}",
+                            sample.sample_id,
+                            cost_info["usage_tokens"]["input_tokens"],
+                            cost_info["usage_tokens"]["cached_input_tokens"],
+                            cost_info["usage_tokens"]["output_tokens"],
+                            float(cost_info["estimated_cost_usd"]),
+                        )
+
                     if is_err:
                         logger.error(
                             "API ERROR/INVALID PAYLOAD | sample={} | latency_ms={:.1f}",
@@ -744,7 +907,7 @@ class JudgeClient:
                             is_err,
                         )
 
-                    return payload
+                    return payload, cost_info
 
                 except Exception as e:
                     last_exc = e
@@ -757,7 +920,7 @@ class JudgeClient:
                         )
                         if use_cache and self.store.enabled:
                             self.store.upsert(cache_key, out, is_error=True)
-                        return out
+                        return out, None
 
                     logger.warning(
                         "API FAILED (retrying) | sample={} | attempt={}/{} | err={}",
@@ -768,7 +931,7 @@ class JudgeClient:
                     )
                     self._sleep_backoff(attempt, e)
 
-        return {"error": f"request_failed_unknown: {last_exc}"}
+        return {"error": f"request_failed_unknown: {last_exc}"}, None
 
 
 # =============================
@@ -802,14 +965,21 @@ class JudgePipeline:
 
     def evaluate_sample(self, sample: MemeSample) -> Dict[str, Any]:
         logger.info("SAMPLE START | {}", sample.sample_id)
-        payload = self.client.judge(
+        payload, cost_info = self.client.judge(
             sample,
             self.cfg,
             use_cache=self.rcfg.use_cache,
             force_refresh=self.rcfg.force_refresh,
         )
         logger.info("SAMPLE DONE | {}", sample.sample_id)
-        return {"sample": asdict(sample), "judge": payload}
+
+        out: Dict[str, Any] = {"sample": asdict(sample), "judge": payload}
+        if self.cfg.cost.enabled:
+            out["cost"] = cost_info or {
+                "model": self.client.model,
+                "note": "cost enabled but no cost info available (e.g., request failed before usage was returned).",
+            }
+        return out
 
     def evaluate_batch(self, samples: Sequence[MemeSample]) -> List[Dict[str, Any]]:
         if not samples:
@@ -826,14 +996,18 @@ class JudgePipeline:
                     out.append(fut.result())
                 except Exception as e:
                     logger.exception("SAMPLE FAILED | {}", s.sample_id)
-                    out.append(
-                        {
-                            "sample": asdict(s),
-                            "judge": {
-                                "error": f"sample_exception: {type(e).__name__}: {e}"
-                            },
+                    err_obj: Dict[str, Any] = {
+                        "sample": asdict(s),
+                        "judge": {
+                            "error": f"sample_exception: {type(e).__name__}: {e}"
+                        },
+                    }
+                    if self.cfg.cost.enabled:
+                        err_obj["cost"] = {
+                            "model": self.client.model,
+                            "note": "sample exception: cost unavailable",
                         }
-                    )
+                    out.append(err_obj)
                 done += 1
                 if done % 10 == 0 or done == len(samples):
                     logger.info("BATCH PROGRESS | {}/{}", done, len(samples))
@@ -851,8 +1025,16 @@ if __name__ == "__main__":
     # Example usage:
     #
     # LOG_LEVEL=DEBUG python judge.py
-    # LOG_LEVEL=INFO LOG_FILE=run.log python judge.py
-    # LOG_LEVEL=TRACE LOG_JSON=1 python judge.py
+    #
+    # Enable cost estimation:
+    #   export OPENAI_PRICE_TABLE_JSON='{"gpt-5.2":{"input":1.75,"cached_input":0.18,"output":14.0}}'
+    #   python judge.py
+    #
+    # OR:
+    #   export OPENAI_PRICE_INPUT_PER_1M=1.75
+    #   export OPENAI_PRICE_CACHED_INPUT_PER_1M=0.18
+    #   export OPENAI_PRICE_OUTPUT_PER_1M=14.0
+    #   python judge.py
 
     sample = MemeSample(
         sample_id="21.png",
@@ -881,10 +1063,11 @@ if __name__ == "__main__":
     )
 
     cfg = JudgeConfig(
-        rationale_first=True,  # global rationale ordering (ALL blocks)
-        images_first=True,  # ablation: images before or after instructions
+        rationale_first=True,
+        images_first=True,
         temperature=0.0,
         max_output_tokens=900,
+        cost=CostConfig(enabled=True),  # <---- 开关：是否输出 cost 字段
     )
 
     pipeline = JudgePipeline(
