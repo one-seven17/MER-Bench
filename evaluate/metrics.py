@@ -133,7 +133,7 @@ class MemeSample:
     tgt_emotion: str
     src_caption_text: Optional[str] = None
     tgt_caption_text: Optional[str] = None
-    edit_spec: Optional[str] = None
+    edit_instruction: Optional[str] = None  # renamed from edit_spec
 
 
 # =============================
@@ -230,12 +230,12 @@ class SQLiteStore:
 
 
 # =============================
-# One-shot schema (STRICT)
+# Schema building (STRICT)
 # =============================
 
 
 @dataclass
-class OneShotConfig:
+class JudgeConfig:
     # Global switch for ALL rationale ordering across ALL blocks
     rationale_first: bool = True
     # Ablation switch: images go before or after the instruction text
@@ -282,10 +282,8 @@ def _ordered_fields(
     return props, req
 
 
-def build_one_shot_schema(rationale_first: bool) -> Tuple[str, Dict[str, Any]]:
-    schema_name = (
-        "one_shot_rationale_first" if rationale_first else "one_shot_rationale_last"
-    )
+def build_judge_schema(rationale_first: bool) -> Tuple[str, Dict[str, Any]]:
+    schema_name = "judge_rationale_first" if rationale_first else "judge_rationale_last"
 
     # Visual/Text assessment blocks
     vt_props, vt_req = _ordered_fields(
@@ -296,7 +294,7 @@ def build_one_shot_schema(rationale_first: bool) -> Tuple[str, Dict[str, Any]]:
         ],
     )
 
-    # Layout block (now includes rationale, and boolean instead of enum)
+    # Layout block (includes rationale)
     layout_props, layout_req = _ordered_fields(
         rationale_first,
         core_fields=[
@@ -304,7 +302,7 @@ def build_one_shot_schema(rationale_first: bool) -> Tuple[str, Dict[str, Any]]:
         ],
     )
 
-    # Emotion classification block (9 labels: 8 + other, other_emotion constrained by prompt; code validates too)
+    # Emotion classification block (9 labels)
     emo_props, emo_req = _ordered_fields(
         rationale_first,
         core_fields=[
@@ -354,55 +352,119 @@ def build_one_shot_schema(rationale_first: bool) -> Tuple[str, Dict[str, Any]]:
 
 
 # =============================
-# Retry config + client
+# Prompt + input builders
 # =============================
 
 
-@dataclass
-class RetryConfig:
-    max_retries: int = 6
-    base_delay_s: float = 0.6
-    max_delay_s: float = 20.0
-    jitter: float = 0.25
-    timeout_s: Optional[float] = 120
+@dataclass(frozen=True)
+class PromptBundle:
+    system_prompt: str
+    user_text: str
 
 
-@dataclass
-class CacheConfig:
-    enabled: bool = True
-    db_path: str = "judge_cache.sqlite3"
-    return_cached_errors: bool = False
+class PromptBuilder:
+    @staticmethod
+    def build_prompts(sample: MemeSample) -> PromptBundle:
+        order_hint = (
+            "Output JSON keys in the exact order implied by the schema. "
+            "Do not add extra keys."
+        )
+
+        system_prompt = (
+            "You are a strict expert judge for meme emotion reframing.\n"
+            "You MUST compare SOURCE vs EDITED.\n"
+            "ONLY the affect/emotion should change; everything else should remain consistent.\n"
+            "\n"
+            "Critical rules:\n"
+            "1) Layout/structure: Preserve panel/grid structure. If SOURCE is single-panel, EDITED must be single-panel.\n"
+            "   If SOURCE is multi-panel/grid meme, EDITED must also be multi-panel/grid and preserve panel order and caption regions.\n"
+            "2) Emotion scoring MUST be target-gated:\n"
+            "   - All emotion-related scores shown in the JSON must first check alignment with TARGET emotion.\n"
+            "   - If EDITED does NOT match TARGET emotion, emotion_accuracy_1_5 MUST be <= 2.\n"
+            "3) Emotion classification:\n"
+            "   - Choose ONE primary emotion label for the EDITED meme.\n"
+            "   - If it fits none of the 8 predefined labels, use label='other' and set other_emotion to the concrete emotion name.\n"
+            "   - If label != 'other', set other_emotion to null.\n"
+            "4) Text-visual semantic alignment:\n"
+            "   - In rationales, explicitly mention whether the caption and visual cues jointly support the same scenario and intended affect.\n"
+            "\n"
+            f"{order_hint}\n"
+            "Return JSON only."
+        )
+
+        user_lines: List[str] = []
+        user_lines.append(
+            f"Allowed emotions (classification): {', '.join(EMOTIONS_8)} + other"
+        )
+        user_lines.append(f"SOURCE emotion (reference): {sample.src_emotion}")
+        user_lines.append(f"TARGET emotion (reference): {sample.tgt_emotion}")
+
+        if sample.src_caption_text:
+            user_lines.append(f"SOURCE caption (reference):\n{sample.src_caption_text}")
+        if sample.tgt_caption_text:
+            user_lines.append(f"TARGET caption (reference):\n{sample.tgt_caption_text}")
+        if sample.edit_instruction:
+            user_lines.append(
+                f"Editing instruction (reference):\n{sample.edit_instruction}"
+            )
+
+        user_lines.append(
+            "Scoring instructions:\n"
+            "- visual_assessment.generation_quality_1_5: visual cleanliness / realism / artifact-free.\n"
+            "- visual_assessment.emotion_accuracy_1_5: ONLY based on visual cues matching TARGET emotion; if not matched => <=2.\n"
+            "- text_assessment.generation_quality_1_5: text legibility, completeness, placement.\n"
+            "- text_assessment.emotion_accuracy_1_5: text affect matches TARGET emotion while describing the same scenario; if not matched => <=2.\n"
+            "- layout_consistency.consistent: true ONLY if panel/grid type and layout match SOURCE (single vs multi-grid).\n"
+            "- overall_emotion_classification: primary emotion of EDITED (8 labels or 'other').\n"
+            "- perceived_emotion_shift.magnitude_1_5: perceived change magnitude from SOURCE to EDITED.\n"
+            "- overall_generation_quality.overall_generation_quality_1_5: holistic output quality.\n"
+            "\n"
+            "Be strict: if non-affective elements drift (subject identity, style, layout, scenario), penalize accordingly.\n"
+            "In each rationale, explicitly state: (a) TARGET emotion alignment, (b) scenario preservation, (c) text-visual semantic alignment."
+        )
+
+        return PromptBundle(
+            system_prompt=system_prompt, user_text="\n\n".join(user_lines)
+        )
 
 
-def _build_user_content(
-    sample: MemeSample, user_text: str, images_first: bool
-) -> List[Dict[str, Any]]:
-    src_img = {
-        "type": "input_image",
-        "image_url": image_to_data_url(sample.src_image_path),
-        "detail": "high",
-    }
-    gen_img = {
-        "type": "input_image",
-        "image_url": image_to_data_url(sample.gen_image_path),
-        "detail": "high",
-    }
+class InputBuilder:
+    @staticmethod
+    def build_user_content(
+        sample: MemeSample, user_text: str, images_first: bool
+    ) -> List[Dict[str, Any]]:
+        src_img = {
+            "type": "input_image",
+            "image_url": image_to_data_url(sample.src_image_path),
+            "detail": "high",
+        }
+        gen_img = {
+            "type": "input_image",
+            "image_url": image_to_data_url(sample.gen_image_path),
+            "detail": "high",
+        }
 
-    if images_first:
-        return [
+        images_block = [
             {"type": "input_text", "text": "SOURCE image:"},
             src_img,
-            {"type": "input_text", "text": "GENERATED image:"},
+            {"type": "input_text", "text": "EDITED image:"},
             gen_img,
-            {"type": "input_text", "text": user_text},
         ]
-    return [
-        {"type": "input_text", "text": user_text},
-        {"type": "input_text", "text": "SOURCE image:"},
-        src_img,
-        {"type": "input_text", "text": "GENERATED image:"},
-        gen_img,
-    ]
+        text_block = [{"type": "input_text", "text": user_text}]
+
+        return images_block + text_block if images_first else text_block + images_block
+
+    @staticmethod
+    def build_messages(
+        system_prompt: str, user_content: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        return [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_prompt}],
+            },
+            {"role": "user", "content": user_content},
+        ]
 
 
 def _post_validate_payload(payload: Dict[str, Any]) -> List[str]:
@@ -431,7 +493,28 @@ def _post_validate_payload(payload: Dict[str, Any]) -> List[str]:
     return errs
 
 
-class OneShotJudgeClient:
+# =============================
+# Retry config + client
+# =============================
+
+
+@dataclass
+class RetryConfig:
+    max_retries: int = 6
+    base_delay_s: float = 0.6
+    max_delay_s: float = 20.0
+    jitter: float = 0.25
+    timeout_s: Optional[float] = 120
+
+
+@dataclass
+class CacheConfig:
+    enabled: bool = True
+    db_path: str = "judge_cache.sqlite3"
+    return_cached_errors: bool = False
+
+
+class JudgeClient:
     def __init__(
         self,
         model: str,
@@ -453,7 +536,7 @@ class OneShotJudgeClient:
         self.store = SQLiteStore(self.cache_cfg.db_path, enabled=self.cache_cfg.enabled)
 
         logger.info(
-            "OneShotJudgeClient ready | model={} | cache_enabled={} | db={}",
+            "JudgeClient ready | model={} | cache_enabled={} | db={}",
             self.model,
             self.store.enabled,
             self.cache_cfg.db_path,
@@ -494,10 +577,9 @@ class OneShotJudgeClient:
         *,
         schema_name: str,
         schema: Dict[str, Any],
-        system_prompt: str,
-        user_text: str,
+        prompts: PromptBundle,
         sample: MemeSample,
-        cfg: OneShotConfig,
+        cfg: JudgeConfig,
         src_sha: str,
         gen_sha: str,
     ) -> str:
@@ -506,8 +588,8 @@ class OneShotJudgeClient:
             "judge_model": self.model,
             "schema_name": schema_name,
             "schema_sha256": schema_sha,
-            "system_prompt_sha256": sha256_bytes(system_prompt.encode("utf-8")),
-            "user_text_sha256": sha256_bytes(user_text.encode("utf-8")),
+            "system_prompt_sha256": sha256_bytes(prompts.system_prompt.encode("utf-8")),
+            "user_text_sha256": sha256_bytes(prompts.user_text.encode("utf-8")),
             "cfg": {
                 "rationale_first": cfg.rationale_first,
                 "images_first": cfg.images_first,
@@ -519,76 +601,22 @@ class OneShotJudgeClient:
             "tgt_emotion": sample.tgt_emotion,
             "src_caption_text": sample.src_caption_text,
             "tgt_caption_text": sample.tgt_caption_text,
-            "edit_spec": sample.edit_spec,
+            "edit_instruction": sample.edit_instruction,
             "src_image_sha256": src_sha,
             "gen_image_sha256": gen_sha,
         }
         return sha256_bytes(stable_json_dumps(descriptor).encode("utf-8"))
 
-    def judge_one_shot(
+    def judge(
         self,
         sample: MemeSample,
-        cfg: OneShotConfig,
+        cfg: JudgeConfig,
         *,
         use_cache: bool = True,
         force_refresh: bool = False,
     ) -> Dict[str, Any]:
-        schema_name, schema = build_one_shot_schema(cfg.rationale_first)
-
-        order_hint = "Output JSON keys in the exact order implied by the schema. Do not add extra keys."
-
-        system_prompt = (
-            "You are a strict expert judge for meme emotion reframing.\n"
-            "You MUST compare SOURCE vs GENERATED.\n"
-            "ONLY the affect/emotion should change; everything else should remain consistent.\n"
-            "\n"
-            "Critical rules:\n"
-            "1) Layout/structure: Preserve panel/grid structure. If SOURCE is single-panel, GENERATED must be single-panel.\n"
-            "   If SOURCE is multi-panel/grid meme, GENERATED must also be multi-panel/grid and preserve panel order and caption regions.\n"
-            "2) Emotion scoring MUST be target-gated:\n"
-            "   - All emotion-related scores must first check alignment with TARGET emotion.\n"
-            "   - If GENERATED does NOT match TARGET emotion, emotion_accuracy_1_5 MUST be <= 2.\n"
-            "3) Emotion classification:\n"
-            "   - Choose ONE primary emotion label for the GENERATED meme.\n"
-            "   - If it fits none of the 8 predefined labels, use label='other' and set other_emotion to the concrete emotion name.\n"
-            "   - If label != 'other', set other_emotion to null.\n"
-            "4) Text-visual semantic alignment:\n"
-            "   - In rationales, explicitly mention whether the caption and visual cues jointly support the same scenario and intended affect.\n"
-            "\n"
-            f"{order_hint}\n"
-            "Return JSON only."
-        )
-
-        # user text (for cache hashing + reference hints)
-        user_lines: List[str] = []
-        user_lines.append(
-            f"Allowed emotions (classification): {', '.join(EMOTIONS_8)} + other"
-        )
-        user_lines.append(f"SOURCE emotion (reference): {sample.src_emotion}")
-        user_lines.append(f"TARGET emotion (reference): {sample.tgt_emotion}")
-
-        if sample.src_caption_text:
-            user_lines.append(f"SOURCE caption (reference):\n{sample.src_caption_text}")
-        if sample.tgt_caption_text:
-            user_lines.append(f"TARGET caption (reference):\n{sample.tgt_caption_text}")
-        if sample.edit_spec:
-            user_lines.append(f"Edit spec (reference):\n{sample.edit_spec}")
-
-        user_lines.append(
-            "Scoring instructions:\n"
-            "- visual_assessment.generation_quality_1_5: visual cleanliness / realism / artifact-free.\n"
-            "- visual_assessment.emotion_accuracy_1_5: ONLY based on visual cues matching TARGET emotion; if not matched => <=2.\n"
-            "- text_assessment.generation_quality_1_5: text legibility, completeness, placement.\n"
-            "- text_assessment.emotion_accuracy_1_5: text affect matches TARGET emotion while describing the same scenario; if not matched => <=2.\n"
-            "- layout_consistency.consistent: true ONLY if panel/grid type and layout match SOURCE (single vs multi-grid).\n"
-            "- overall_emotion_classification: primary emotion of GENERATED (8 labels or 'other').\n"
-            "- perceived_emotion_shift.magnitude_1_5: perceived change magnitude from SOURCE to GENERATED.\n"
-            "- overall_generation_quality.overall_generation_quality_1_5: holistic output quality.\n"
-            "\n"
-            "Be strict: if non-affective elements drift (subject identity, style, layout, scenario), penalize accordingly.\n"
-            "In each rationale, explicitly state: (a) TARGET emotion alignment, (b) scenario preservation, (c) text-visual semantic alignment."
-        )
-        user_text = "\n\n".join(user_lines)
+        schema_name, schema = build_judge_schema(cfg.rationale_first)
+        prompts = PromptBuilder.build_prompts(sample)
 
         # image hashes
         src_sha = sha256_file(sample.src_image_path)
@@ -597,8 +625,7 @@ class OneShotJudgeClient:
         cache_key = self._build_cache_key(
             schema_name=schema_name,
             schema=schema,
-            system_prompt=system_prompt,
-            user_text=user_text,
+            prompts=prompts,
             sample=sample,
             cfg=cfg,
             src_sha=src_sha,
@@ -622,20 +649,23 @@ class OneShotJudgeClient:
                     cache_short,
                 )
 
-        if force_refresh:
+        (
             logger.warning(
                 "FORCE REFRESH | sample={} | key={}", sample.sample_id, cache_short
             )
-        else:
-            logger.info(
+            if force_refresh
+            else logger.info(
                 "CACHE MISS | sample={} | key={}", sample.sample_id, cache_short
             )
+        )
 
-        # One-shot call with retries
-        last_exc: Optional[Exception] = None
-        t0 = time.time()
+        # Build input content/messages (encapsulated)
+        user_content = InputBuilder.build_user_content(
+            sample, prompts.user_text, images_first=cfg.images_first
+        )
+        messages = InputBuilder.build_messages(prompts.system_prompt, user_content)
 
-        # Lightweight logging to ensure images are present in request payload construction
+        # Lightweight logging to ensure images exist on disk
         try:
             logger.debug(
                 "IMG INFO | sample={} | src_bytes={} | gen_bytes={}",
@@ -646,7 +676,8 @@ class OneShotJudgeClient:
         except Exception:
             pass
 
-        user_content = _build_user_content(sample, user_text, cfg.images_first)
+        last_exc: Optional[Exception] = None
+        t0 = time.time()
 
         with self._sem:
             for attempt in range(self.retry.max_retries + 1):
@@ -662,18 +693,7 @@ class OneShotJudgeClient:
 
                     resp = self.client.responses.create(
                         model=self.model,
-                        input=[
-                            {
-                                "role": "system",
-                                "content": [
-                                    {"type": "input_text", "text": system_prompt}
-                                ],
-                            },
-                            {
-                                "role": "user",
-                                "content": user_content,
-                            },
-                        ],
+                        input=messages,
                         text={
                             "format": {
                                 "type": "json_schema",
@@ -695,7 +715,6 @@ class OneShotJudgeClient:
                         post_errs = _post_validate_payload(payload)
                         if post_errs:
                             payload["_post_validation_errors"] = post_errs
-                            # treat as error-ish but still store (your call). We mark is_err True for cache classification.
                             is_err = True
                             logger.error(
                                 "POST-VALIDATION FAILED | sample={} | errs={}",
@@ -768,11 +787,11 @@ class RunConfig:
     force_refresh: bool = False
 
 
-class OneShotPipeline:
+class JudgePipeline:
     def __init__(
         self,
-        client: OneShotJudgeClient,
-        cfg: OneShotConfig,
+        client: JudgeClient,
+        cfg: JudgeConfig,
         ccfg: Optional[ConcurrencyConfig] = None,
         rcfg: Optional[RunConfig] = None,
     ):
@@ -783,7 +802,7 @@ class OneShotPipeline:
 
     def evaluate_sample(self, sample: MemeSample) -> Dict[str, Any]:
         logger.info("SAMPLE START | {}", sample.sample_id)
-        payload = self.client.judge_one_shot(
+        payload = self.client.judge(
             sample,
             self.cfg,
             use_cache=self.rcfg.use_cache,
@@ -831,9 +850,9 @@ class OneShotPipeline:
 if __name__ == "__main__":
     # Example usage:
     #
-    # LOG_LEVEL=DEBUG python oneshot_judge.py
-    # LOG_LEVEL=INFO LOG_FILE=run.log python oneshot_judge.py
-    # LOG_LEVEL=TRACE LOG_JSON=1 python oneshot_judge.py
+    # LOG_LEVEL=DEBUG python judge.py
+    # LOG_LEVEL=INFO LOG_FILE=run.log python judge.py
+    # LOG_LEVEL=TRACE LOG_JSON=1 python judge.py
 
     sample = MemeSample(
         sample_id="21.png",
@@ -843,10 +862,10 @@ if __name__ == "__main__":
         tgt_emotion="calm",
         src_caption_text="Me when the customer puts their money on the\ncounter instead of my outstretched hand\nMemeCenter.com\n",
         tgt_caption_text="Me when the customer smiles and thanks me while paying — what a great start to the day!",
-        edit_spec="Transform the expression into calm/content, warmer softer lighting, preserve layout and subject.",
+        edit_instruction="Transform the expression into calm/content, warmer softer lighting, preserve layout and subject.",
     )
 
-    client = OneShotJudgeClient(
+    client = JudgeClient(
         model="gpt-5.2",
         retry=RetryConfig(
             max_retries=6,
@@ -861,14 +880,14 @@ if __name__ == "__main__":
         ),
     )
 
-    cfg = OneShotConfig(
+    cfg = JudgeConfig(
         rationale_first=True,  # global rationale ordering (ALL blocks)
         images_first=True,  # ablation: images before or after instructions
         temperature=0.0,
         max_output_tokens=900,
     )
 
-    pipeline = OneShotPipeline(
+    pipeline = JudgePipeline(
         client=client,
         cfg=cfg,
         ccfg=ConcurrencyConfig(sample_workers=2),
