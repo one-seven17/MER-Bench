@@ -24,18 +24,17 @@ except Exception:  # pragma: no cover
     APITimeoutError = type("APITimeoutError", (Exception,), {})
     APIConnectionError = type("APIConnectionError", (Exception,), {})
 
-
-# -----------------------------
-# Logging setup
-# -----------------------------
+# =============================
+# Logging
+# =============================
 
 
 def setup_logging() -> None:
     """
-    Controls (env):
-      - LOG_LEVEL: TRACE|DEBUG|INFO|WARNING|ERROR (default INFO)
-      - LOG_JSON: 1 to output JSON logs (default 0)
-      - LOG_FILE: path to write logs (optional)
+    Env:
+      LOG_LEVEL: TRACE|DEBUG|INFO|WARNING|ERROR (default INFO)
+      LOG_JSON: 1 => serialize JSON logs
+      LOG_FILE: optional file sink
     """
     level = os.environ.get("LOG_LEVEL", "INFO").upper().strip()
     log_json = os.environ.get("LOG_JSON", "0").strip() in (
@@ -45,49 +44,33 @@ def setup_logging() -> None:
         "YES",
         "yes",
     )
-    log_file = os.environ.get("LOG_FILE", "").strip()
+    log_file = (os.environ.get("LOG_FILE") or "").strip()
 
     logger.remove()
-
-    if log_json:
-        # JSON-like logs via serialize=True (loguru)
-        logger.add(lambda msg: print(msg, end=""), level=level, serialize=True)
-    else:
-        logger.add(lambda msg: print(msg, end=""), level=level)
-
+    logger.add(lambda m: print(m, end=""), level=level, serialize=log_json)
     if log_file:
-        # Rotating file sink; keep it simple and safe
         logger.add(
-            log_file, level=level, rotation="10 MB", retention="10 days", enqueue=True
+            log_file, level=level, rotation="10 MB", retention="7 days", enqueue=True
         )
-
-    logger.debug(
-        "Logging initialized: level={}, json={}, file={}", level, log_json, log_file
-    )
 
 
 setup_logging()
 
-
-# -----------------------------
+# =============================
 # Constants & helpers
-# -----------------------------
+# =============================
 
 EMOTIONS_8 = ["angry", "sad", "fear", "disgust", "calm", "happy", "excited", "relaxed"]
+EMOTIONS_9 = EMOTIONS_8 + ["other"]
 
 
 def image_to_data_url(path: str) -> str:
     ext = os.path.splitext(path)[1].lower().lstrip(".")
     if ext == "jpg":
         ext = "jpeg"
-    mime = f"image/{ext}"
     with open(path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode("utf-8")
-    return f"data:{mime};base64,{b64}"
-
-
-def sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+    return f"data:image/{ext};base64,{b64}"
 
 
 def sha256_file(path: str) -> str:
@@ -98,8 +81,12 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def stable_json_dumps(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+def sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def stable_json_dumps(x: Any) -> str:
+    return json.dumps(x, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _safe_json_loads(text: str) -> Dict[str, Any]:
@@ -109,21 +96,7 @@ def _safe_json_loads(text: str) -> Dict[str, Any]:
         return {"error": f"json_parse_failed: {e}", "raw_text": text}
 
 
-def likert_to_unit(x: int, k: int = 5) -> float:
-    x = max(1, min(k, int(x)))
-    return (x - 1) / (k - 1) if k > 1 else 0.0
-
-
-def tri_to_unit(label: str) -> float:
-    m = {"yes": 1.0, "partial": 0.5, "no": 0.0}
-    return m.get(str(label).strip().lower(), 0.0)
-
-
 def _get_retry_after_seconds(exc: Exception) -> Optional[float]:
-    """
-    Best-effort parse Retry-After from exception/response.
-    openai-python exception surface can differ across versions.
-    """
     for attr in ("response", "http_response"):
         resp = getattr(exc, attr, None)
         if resp is not None:
@@ -135,7 +108,6 @@ def _get_retry_after_seconds(exc: Exception) -> Optional[float]:
                         return float(ra)
                     except Exception:
                         pass
-
     headers = getattr(exc, "headers", None)
     if headers:
         ra = headers.get("retry-after") or headers.get("Retry-After")
@@ -147,69 +119,35 @@ def _get_retry_after_seconds(exc: Exception) -> Optional[float]:
     return None
 
 
-# -----------------------------
+# =============================
 # Data model
-# -----------------------------
+# =============================
 
 
 @dataclass(frozen=True)
 class MemeSample:
     sample_id: str
     src_image_path: str
-    src_emotion: str
     gen_image_path: str
+    src_emotion: str
     tgt_emotion: str
     src_caption_text: Optional[str] = None
     tgt_caption_text: Optional[str] = None
     edit_spec: Optional[str] = None
 
 
-@dataclass
-class MetricResult:
-    metric_id: str
-    metric_name: str
-    score: float  # normalized 0..1
-    label: str  # short categorical label
-    rationale: str  # short explanation
-    evidence: Optional[Dict[str, Any]] = None
-    raw: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None  # non-null if failed after retries / parse issues
-
-
-@dataclass
-class SampleJudgement:
-    sample_id: str
-    src_emotion: str
-    tgt_emotion: str
-    results: List[MetricResult]
-
-    def aggregate(self, weights: Optional[Dict[str, float]] = None) -> float:
-        ok = [r for r in self.results if r.error is None]
-        if not ok:
-            return 0.0
-        if not weights:
-            return sum(r.score for r in ok) / len(ok)
-        total_w = 0.0
-        total = 0.0
-        for r in ok:
-            w = float(weights.get(r.metric_id, 0.0))
-            total += r.score * w
-            total_w += w
-        return (total / total_w) if total_w > 0 else 0.0
-
-
-# -----------------------------
-# SQLite cache + results store (unified)
-# -----------------------------
+# =============================
+# SQLite cache
+# =============================
 
 
 class SQLiteStore:
     """
-    Unified cache + results log store using SQLite (stdlib).
+    Minimal unified cache: key -> payload JSON
 
-    Concurrency:
-    - Thread-safe with a process-level lock.
-    - SQLite WAL improves concurrent access.
+    Notes:
+    - Thread-safe using a process-level lock.
+    - Uses WAL to reduce writer blocking.
     """
 
     def __init__(self, db_path: str = "judge_cache.sqlite3", enabled: bool = True):
@@ -223,7 +161,6 @@ class SQLiteStore:
         conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA temp_store=MEMORY;")
         return conn
 
     def _init_db(self) -> None:
@@ -234,40 +171,11 @@ class SQLiteStore:
                     """
                     CREATE TABLE IF NOT EXISTS judge_cache (
                         cache_key TEXT PRIMARY KEY,
-                        created_at REAL NOT NULL,
-                        updated_at REAL NOT NULL,
-
-                        judge_model TEXT NOT NULL,
-                        metric_id TEXT NOT NULL,
-                        schema_name TEXT NOT NULL,
-
-                        sample_id TEXT NOT NULL,
-                        src_emotion TEXT,
-                        tgt_emotion TEXT,
-
-                        src_image_sha256 TEXT,
-                        gen_image_sha256 TEXT,
-
-                        system_prompt_sha256 TEXT NOT NULL,
-                        user_text_sha256 TEXT NOT NULL,
-
                         payload_json TEXT NOT NULL,
                         is_error INTEGER NOT NULL DEFAULT 0,
-
-                        last_latency_ms REAL,
-                        last_attempts INTEGER,
-                        last_cache_hit INTEGER NOT NULL DEFAULT 0
+                        updated_at REAL NOT NULL
                     )
                     """
-                )
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_metric ON judge_cache(metric_id)"
-                )
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_sample ON judge_cache(sample_id)"
-                )
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_model ON judge_cache(judge_model)"
                 )
                 conn.commit()
                 logger.debug("SQLiteStore initialized at {}", self.db_path)
@@ -294,143 +202,160 @@ class SQLiteStore:
             finally:
                 conn.close()
 
-    def upsert(
-        self,
-        *,
-        cache_key: str,
-        judge_model: str,
-        metric_id: str,
-        schema_name: str,
-        sample: MemeSample,
-        src_image_sha256: Optional[str],
-        gen_image_sha256: Optional[str],
-        system_prompt_sha256: str,
-        user_text_sha256: str,
-        payload: Dict[str, Any],
-        is_error: bool,
-        latency_ms: Optional[float],
-        attempts: Optional[int],
-        cache_hit: bool,
-        overwrite: bool,
-    ) -> None:
+    def upsert(self, cache_key: str, payload: Dict[str, Any], is_error: bool) -> None:
         if not self.enabled:
             return
-
-        now = time.time()
-        payload_json = json.dumps(payload, ensure_ascii=False)
-
         with self._lock:
             conn = self._connect()
             try:
-                if overwrite:
-                    conn.execute(
-                        """
-                        INSERT INTO judge_cache(
-                            cache_key, created_at, updated_at,
-                            judge_model, metric_id, schema_name,
-                            sample_id, src_emotion, tgt_emotion,
-                            src_image_sha256, gen_image_sha256,
-                            system_prompt_sha256, user_text_sha256,
-                            payload_json, is_error,
-                            last_latency_ms, last_attempts, last_cache_hit
-                        ) VALUES(
-                            ?, ?, ?,
-                            ?, ?, ?,
-                            ?, ?, ?,
-                            ?, ?,
-                            ?, ?,
-                            ?, ?,
-                            ?, ?, ?
-                        )
-                        ON CONFLICT(cache_key) DO UPDATE SET
-                            updated_at=excluded.updated_at,
-                            judge_model=excluded.judge_model,
-                            metric_id=excluded.metric_id,
-                            schema_name=excluded.schema_name,
-                            sample_id=excluded.sample_id,
-                            src_emotion=excluded.src_emotion,
-                            tgt_emotion=excluded.tgt_emotion,
-                            src_image_sha256=excluded.src_image_sha256,
-                            gen_image_sha256=excluded.gen_image_sha256,
-                            system_prompt_sha256=excluded.system_prompt_sha256,
-                            user_text_sha256=excluded.user_text_sha256,
-                            payload_json=excluded.payload_json,
-                            is_error=excluded.is_error,
-                            last_latency_ms=excluded.last_latency_ms,
-                            last_attempts=excluded.last_attempts,
-                            last_cache_hit=excluded.last_cache_hit
-                        """,
-                        (
-                            cache_key,
-                            now,
-                            now,
-                            judge_model,
-                            metric_id,
-                            schema_name,
-                            sample.sample_id,
-                            sample.src_emotion,
-                            sample.tgt_emotion,
-                            src_image_sha256,
-                            gen_image_sha256,
-                            system_prompt_sha256,
-                            user_text_sha256,
-                            payload_json,
-                            1 if is_error else 0,
-                            latency_ms,
-                            attempts,
-                            1 if cache_hit else 0,
-                        ),
-                    )
-                else:
-                    conn.execute(
-                        """
-                        INSERT OR IGNORE INTO judge_cache(
-                            cache_key, created_at, updated_at,
-                            judge_model, metric_id, schema_name,
-                            sample_id, src_emotion, tgt_emotion,
-                            src_image_sha256, gen_image_sha256,
-                            system_prompt_sha256, user_text_sha256,
-                            payload_json, is_error,
-                            last_latency_ms, last_attempts, last_cache_hit
-                        ) VALUES(
-                            ?, ?, ?,
-                            ?, ?, ?,
-                            ?, ?, ?,
-                            ?, ?,
-                            ?, ?,
-                            ?, ?,
-                            ?, ?, ?
-                        )
-                        """,
-                        (
-                            cache_key,
-                            now,
-                            now,
-                            judge_model,
-                            metric_id,
-                            schema_name,
-                            sample.sample_id,
-                            sample.src_emotion,
-                            sample.tgt_emotion,
-                            src_image_sha256,
-                            gen_image_sha256,
-                            system_prompt_sha256,
-                            user_text_sha256,
-                            payload_json,
-                            1 if is_error else 0,
-                            latency_ms,
-                            attempts,
-                            1 if cache_hit else 0,
-                        ),
-                    )
+                conn.execute(
+                    """
+                    INSERT INTO judge_cache(cache_key, payload_json, is_error, updated_at)
+                    VALUES(?, ?, ?, ?)
+                    ON CONFLICT(cache_key) DO UPDATE SET
+                        payload_json=excluded.payload_json,
+                        is_error=excluded.is_error,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        cache_key,
+                        json.dumps(payload, ensure_ascii=False),
+                        1 if is_error else 0,
+                        time.time(),
+                    ),
+                )
                 conn.commit()
             finally:
                 conn.close()
 
 
-# -----------------------------
-# OpenAI client wrapper with retries + caching/store
-# -----------------------------
+# =============================
+# One-shot schema (STRICT)
+# =============================
+
+
+@dataclass
+class OneShotConfig:
+    # Global switch for ALL rationale ordering across ALL blocks
+    rationale_first: bool = True
+    # Ablation switch: images go before or after the instruction text
+    images_first: bool = True
+    temperature: float = 0.0
+    max_output_tokens: int = 900
+
+
+def _obj(properties: Dict[str, Any], required: List[str]) -> Dict[str, Any]:
+    """
+    Helper to produce strict object schema blocks required by OpenAI:
+    - MUST include additionalProperties: false
+    """
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+        "required": required,
+    }
+
+
+def _ordered_fields(
+    rationale_first: bool, core_fields: List[Tuple[str, Dict[str, Any]]]
+) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Build an object properties dict + required list with rationale placed first or last.
+    core_fields: list of (field_name, field_schema) excluding 'rationale'
+    """
+    props: Dict[str, Any] = {}
+    req: List[str] = []
+
+    if rationale_first:
+        props["rationale"] = {"type": "string"}
+        req.append("rationale")
+
+    for k, v in core_fields:
+        props[k] = v
+        req.append(k)
+
+    if not rationale_first:
+        props["rationale"] = {"type": "string"}
+        req.append("rationale")
+
+    return props, req
+
+
+def build_one_shot_schema(rationale_first: bool) -> Tuple[str, Dict[str, Any]]:
+    schema_name = (
+        "one_shot_rationale_first" if rationale_first else "one_shot_rationale_last"
+    )
+
+    # Visual/Text assessment blocks
+    vt_props, vt_req = _ordered_fields(
+        rationale_first,
+        core_fields=[
+            ("generation_quality_1_5", {"type": "integer", "minimum": 1, "maximum": 5}),
+            ("emotion_accuracy_1_5", {"type": "integer", "minimum": 1, "maximum": 5}),
+        ],
+    )
+
+    # Layout block (now includes rationale, and boolean instead of enum)
+    layout_props, layout_req = _ordered_fields(
+        rationale_first,
+        core_fields=[
+            ("consistent", {"type": "boolean"}),
+        ],
+    )
+
+    # Emotion classification block (9 labels: 8 + other, other_emotion constrained by prompt; code validates too)
+    emo_props, emo_req = _ordered_fields(
+        rationale_first,
+        core_fields=[
+            ("label", {"type": "string", "enum": EMOTIONS_9}),
+            ("other_emotion", {"type": ["string", "null"]}),
+        ],
+    )
+
+    # Shift block
+    shift_props, shift_req = _ordered_fields(
+        rationale_first,
+        core_fields=[
+            ("magnitude_1_5", {"type": "integer", "minimum": 1, "maximum": 5}),
+        ],
+    )
+
+    # Overall quality block
+    oq_props, oq_req = _ordered_fields(
+        rationale_first,
+        core_fields=[
+            (
+                "overall_generation_quality_1_5",
+                {"type": "integer", "minimum": 1, "maximum": 5},
+            ),
+        ],
+    )
+
+    schema = _obj(
+        properties={
+            "visual_assessment": _obj(vt_props, vt_req),
+            "text_assessment": _obj(vt_props, vt_req),
+            "layout_consistency": _obj(layout_props, layout_req),
+            "overall_emotion_classification": _obj(emo_props, emo_req),
+            "perceived_emotion_shift": _obj(shift_props, shift_req),
+            "overall_generation_quality": _obj(oq_props, oq_req),
+        },
+        required=[
+            "visual_assessment",
+            "text_assessment",
+            "layout_consistency",
+            "overall_emotion_classification",
+            "perceived_emotion_shift",
+            "overall_generation_quality",
+        ],
+    )
+    return schema_name, schema
+
+
+# =============================
+# Retry config + client
+# =============================
 
 
 @dataclass
@@ -449,28 +374,86 @@ class CacheConfig:
     return_cached_errors: bool = False
 
 
-class JudgeClient:
+def _build_user_content(
+    sample: MemeSample, user_text: str, images_first: bool
+) -> List[Dict[str, Any]]:
+    src_img = {
+        "type": "input_image",
+        "image_url": image_to_data_url(sample.src_image_path),
+        "detail": "high",
+    }
+    gen_img = {
+        "type": "input_image",
+        "image_url": image_to_data_url(sample.gen_image_path),
+        "detail": "high",
+    }
+
+    if images_first:
+        return [
+            {"type": "input_text", "text": "SOURCE image:"},
+            src_img,
+            {"type": "input_text", "text": "GENERATED image:"},
+            gen_img,
+            {"type": "input_text", "text": user_text},
+        ]
+    return [
+        {"type": "input_text", "text": user_text},
+        {"type": "input_text", "text": "SOURCE image:"},
+        src_img,
+        {"type": "input_text", "text": "GENERATED image:"},
+        gen_img,
+    ]
+
+
+def _post_validate_payload(payload: Dict[str, Any]) -> List[str]:
+    """
+    Best-effort validation beyond JSON schema:
+    - If label != 'other' -> other_emotion should be null
+    - If label == 'other' -> other_emotion should be a non-empty string
+    """
+    errs: List[str] = []
+    try:
+        cls = payload.get("overall_emotion_classification", {})
+        label = cls.get("label")
+        other_emotion = cls.get("other_emotion")
+        if label == "other":
+            if not isinstance(other_emotion, str) or not other_emotion.strip():
+                errs.append(
+                    "overall_emotion_classification.other_emotion must be a non-empty string when label=='other'"
+                )
+        else:
+            if other_emotion is not None:
+                errs.append(
+                    "overall_emotion_classification.other_emotion must be null when label!='other'"
+                )
+    except Exception as e:
+        errs.append(f"post_validate_exception: {type(e).__name__}: {e}")
+    return errs
+
+
+class OneShotJudgeClient:
     def __init__(
         self,
-        model: str = "gpt-5-mini",
+        model: str,
         api_key: Optional[str] = None,
         retry: Optional[RetryConfig] = None,
         max_in_flight: int = 8,
         cache: Optional[CacheConfig] = None,
     ):
+        # NOTE: If you suspect your proxy drops images, unset OPENAI_API_BASE to use default.
         self.client = OpenAI(
             api_key=api_key or os.environ.get("OPENAI_API_KEY"),
             base_url=os.environ.get("OPENAI_API_BASE"),
         )
         self.model = model
         self.retry = retry or RetryConfig()
-        self._in_flight = threading.Semaphore(max_in_flight)
+        self._sem = threading.Semaphore(max_in_flight)
+
         self.cache_cfg = cache or CacheConfig()
-        self.store = SQLiteStore(
-            db_path=self.cache_cfg.db_path, enabled=self.cache_cfg.enabled
-        )
+        self.store = SQLiteStore(self.cache_cfg.db_path, enabled=self.cache_cfg.enabled)
+
         logger.info(
-            "JudgeClient ready | model={} | cache_enabled={} | db={}",
+            "OneShotJudgeClient ready | model={} | cache_enabled={} | db={}",
             self.model,
             self.store.enabled,
             self.cache_cfg.db_path,
@@ -506,140 +489,177 @@ class JudgeClient:
         logger.warning("Backoff sleep: {:.2f}s (attempt={})", delay, attempt + 1)
         time.sleep(delay)
 
-    def build_cache_key(
+    def _build_cache_key(
         self,
         *,
-        metric_id: str,
         schema_name: str,
+        schema: Dict[str, Any],
         system_prompt: str,
+        user_text: str,
         sample: MemeSample,
-        user_parts: List[Dict[str, Any]],
-        src_image_sha256: Optional[str],
-        gen_image_sha256: Optional[str],
-    ) -> Tuple[str, str, str]:
-        text_parts: List[str] = []
-        for p in user_parts:
-            if p.get("type") == "input_text":
-                text_parts.append(str(p.get("text", "")))
-
-        system_prompt_sha = sha256_bytes(system_prompt.encode("utf-8"))
-        user_text_sha = sha256_bytes(stable_json_dumps(text_parts).encode("utf-8"))
-
+        cfg: OneShotConfig,
+        src_sha: str,
+        gen_sha: str,
+    ) -> str:
+        schema_sha = sha256_bytes(stable_json_dumps(schema).encode("utf-8"))
         descriptor = {
             "judge_model": self.model,
-            "metric_id": metric_id,
             "schema_name": schema_name,
-            "system_prompt_sha256": system_prompt_sha,
+            "schema_sha256": schema_sha,
+            "system_prompt_sha256": sha256_bytes(system_prompt.encode("utf-8")),
+            "user_text_sha256": sha256_bytes(user_text.encode("utf-8")),
+            "cfg": {
+                "rationale_first": cfg.rationale_first,
+                "images_first": cfg.images_first,
+                "temperature": cfg.temperature,
+                "max_output_tokens": cfg.max_output_tokens,
+            },
             "sample_id": sample.sample_id,
             "src_emotion": sample.src_emotion,
             "tgt_emotion": sample.tgt_emotion,
             "src_caption_text": sample.src_caption_text,
             "tgt_caption_text": sample.tgt_caption_text,
             "edit_spec": sample.edit_spec,
-            "src_image_sha256": src_image_sha256,
-            "gen_image_sha256": gen_image_sha256,
-            "user_text_sha256": user_text_sha,
+            "src_image_sha256": src_sha,
+            "gen_image_sha256": gen_sha,
         }
-        cache_key = sha256_bytes(stable_json_dumps(descriptor).encode("utf-8"))
-        return cache_key, system_prompt_sha, user_text_sha
+        return sha256_bytes(stable_json_dumps(descriptor).encode("utf-8"))
 
-    def run_json_schema(
+    def judge_one_shot(
         self,
-        *,
-        metric_id: str,
         sample: MemeSample,
-        system_prompt: str,
-        user_parts: List[Dict[str, Any]],
-        schema_name: str,
-        schema: Dict[str, Any],
-        temperature: float = 0.0,
-        max_output_tokens: int = 400,
+        cfg: OneShotConfig,
+        *,
         use_cache: bool = True,
         force_refresh: bool = False,
-        src_image_sha256: Optional[str] = None,
-        gen_image_sha256: Optional[str] = None,
     ) -> Dict[str, Any]:
-        cache_key, sp_sha, ut_sha = self.build_cache_key(
-            metric_id=metric_id,
-            schema_name=schema_name,
-            system_prompt=system_prompt,
-            sample=sample,
-            user_parts=user_parts,
-            src_image_sha256=src_image_sha256,
-            gen_image_sha256=gen_image_sha256,
+        schema_name, schema = build_one_shot_schema(cfg.rationale_first)
+
+        order_hint = "Output JSON keys in the exact order implied by the schema. Do not add extra keys."
+
+        system_prompt = (
+            "You are a strict expert judge for meme emotion reframing.\n"
+            "You MUST compare SOURCE vs GENERATED.\n"
+            "ONLY the affect/emotion should change; everything else should remain consistent.\n"
+            "\n"
+            "Critical rules:\n"
+            "1) Layout/structure: Preserve panel/grid structure. If SOURCE is single-panel, GENERATED must be single-panel.\n"
+            "   If SOURCE is multi-panel/grid meme, GENERATED must also be multi-panel/grid and preserve panel order and caption regions.\n"
+            "2) Emotion scoring MUST be target-gated:\n"
+            "   - All emotion-related scores must first check alignment with TARGET emotion.\n"
+            "   - If GENERATED does NOT match TARGET emotion, emotion_accuracy_1_5 MUST be <= 2.\n"
+            "3) Emotion classification:\n"
+            "   - Choose ONE primary emotion label for the GENERATED meme.\n"
+            "   - If it fits none of the 8 predefined labels, use label='other' and set other_emotion to the concrete emotion name.\n"
+            "   - If label != 'other', set other_emotion to null.\n"
+            "4) Text-visual semantic alignment:\n"
+            "   - In rationales, explicitly mention whether the caption and visual cues jointly support the same scenario and intended affect.\n"
+            "\n"
+            f"{order_hint}\n"
+            "Return JSON only."
         )
 
-        cache_key_short = cache_key[:12]
+        # user text (for cache hashing + reference hints)
+        user_lines: List[str] = []
+        user_lines.append(
+            f"Allowed emotions (classification): {', '.join(EMOTIONS_8)} + other"
+        )
+        user_lines.append(f"SOURCE emotion (reference): {sample.src_emotion}")
+        user_lines.append(f"TARGET emotion (reference): {sample.tgt_emotion}")
 
-        # Cache read
+        if sample.src_caption_text:
+            user_lines.append(f"SOURCE caption (reference):\n{sample.src_caption_text}")
+        if sample.tgt_caption_text:
+            user_lines.append(f"TARGET caption (reference):\n{sample.tgt_caption_text}")
+        if sample.edit_spec:
+            user_lines.append(f"Edit spec (reference):\n{sample.edit_spec}")
+
+        user_lines.append(
+            "Scoring instructions:\n"
+            "- visual_assessment.generation_quality_1_5: visual cleanliness / realism / artifact-free.\n"
+            "- visual_assessment.emotion_accuracy_1_5: ONLY based on visual cues matching TARGET emotion; if not matched => <=2.\n"
+            "- text_assessment.generation_quality_1_5: text legibility, completeness, placement.\n"
+            "- text_assessment.emotion_accuracy_1_5: text affect matches TARGET emotion while describing the same scenario; if not matched => <=2.\n"
+            "- layout_consistency.consistent: true ONLY if panel/grid type and layout match SOURCE (single vs multi-grid).\n"
+            "- overall_emotion_classification: primary emotion of GENERATED (8 labels or 'other').\n"
+            "- perceived_emotion_shift.magnitude_1_5: perceived change magnitude from SOURCE to GENERATED.\n"
+            "- overall_generation_quality.overall_generation_quality_1_5: holistic output quality.\n"
+            "\n"
+            "Be strict: if non-affective elements drift (subject identity, style, layout, scenario), penalize accordingly.\n"
+            "In each rationale, explicitly state: (a) TARGET emotion alignment, (b) scenario preservation, (c) text-visual semantic alignment."
+        )
+        user_text = "\n\n".join(user_lines)
+
+        # image hashes
+        src_sha = sha256_file(sample.src_image_path)
+        gen_sha = sha256_file(sample.gen_image_path)
+
+        cache_key = self._build_cache_key(
+            schema_name=schema_name,
+            schema=schema,
+            system_prompt=system_prompt,
+            user_text=user_text,
+            sample=sample,
+            cfg=cfg,
+            src_sha=src_sha,
+            gen_sha=gen_sha,
+        )
+        cache_short = cache_key[:12]
+
+        # cache read
         if use_cache and self.store.enabled and not force_refresh:
             cached = self.store.get(cache_key)
             if cached is not None:
                 is_err = bool(cached.get("_cached_is_error", False))
                 if (not is_err) or self.cache_cfg.return_cached_errors:
                     logger.info(
-                        "CACHE HIT | sample={} | metric={} | key={}",
-                        sample.sample_id,
-                        metric_id,
-                        cache_key_short,
-                    )
-                    # Record the hit (light touch, does not overwrite payload)
-                    self.store.upsert(
-                        cache_key=cache_key,
-                        judge_model=self.model,
-                        metric_id=metric_id,
-                        schema_name=schema_name,
-                        sample=sample,
-                        src_image_sha256=src_image_sha256,
-                        gen_image_sha256=gen_image_sha256,
-                        system_prompt_sha256=sp_sha,
-                        user_text_sha256=ut_sha,
-                        payload=cached,
-                        is_error=is_err,
-                        latency_ms=None,
-                        attempts=None,
-                        cache_hit=True,
-                        overwrite=False,
+                        "CACHE HIT | sample={} | key={}", sample.sample_id, cache_short
                     )
                     return cached
                 logger.warning(
-                    "CACHE HAS ERROR (ignored) | sample={} | metric={} | key={}",
+                    "CACHE ERROR (ignored) | sample={} | key={}",
                     sample.sample_id,
-                    metric_id,
-                    cache_key_short,
+                    cache_short,
                 )
 
         if force_refresh:
             logger.warning(
-                "FORCE REFRESH | sample={} | metric={} | key={}",
-                sample.sample_id,
-                metric_id,
-                cache_key_short,
+                "FORCE REFRESH | sample={} | key={}", sample.sample_id, cache_short
             )
         else:
             logger.info(
-                "CACHE MISS | sample={} | metric={} | key={}",
-                sample.sample_id,
-                metric_id,
-                cache_key_short,
+                "CACHE MISS | sample={} | key={}", sample.sample_id, cache_short
             )
 
-        # API call with retries
+        # One-shot call with retries
         last_exc: Optional[Exception] = None
         t0 = time.time()
-        attempts_used: Optional[int] = None
 
-        with self._in_flight:
+        # Lightweight logging to ensure images are present in request payload construction
+        try:
+            logger.debug(
+                "IMG INFO | sample={} | src_bytes={} | gen_bytes={}",
+                sample.sample_id,
+                os.path.getsize(sample.src_image_path),
+                os.path.getsize(sample.gen_image_path),
+            )
+        except Exception:
+            pass
+
+        user_content = _build_user_content(sample, user_text, cfg.images_first)
+
+        with self._sem:
             for attempt in range(self.retry.max_retries + 1):
-                attempts_used = attempt + 1
                 try:
                     logger.debug(
-                        "API CALL | sample={} | metric={} | attempt={}/{}",
+                        "API CALL | sample={} | attempt={}/{} | images_first={} | rationale_first={}",
                         sample.sample_id,
-                        metric_id,
-                        attempts_used,
+                        attempt + 1,
                         self.retry.max_retries + 1,
+                        cfg.images_first,
+                        cfg.rationale_first,
                     )
+
                     resp = self.client.responses.create(
                         model=self.model,
                         input=[
@@ -649,7 +669,10 @@ class JudgeClient:
                                     {"type": "input_text", "text": system_prompt}
                                 ],
                             },
-                            {"role": "user", "content": user_parts},
+                            {
+                                "role": "user",
+                                "content": user_content,
+                            },
                         ],
                         text={
                             "format": {
@@ -659,831 +682,84 @@ class JudgeClient:
                                 "schema": schema,
                             }
                         },
-                        temperature=temperature,
-                        max_output_tokens=max_output_tokens,
+                        temperature=cfg.temperature,
+                        max_output_tokens=cfg.max_output_tokens,
                         timeout=self.retry.timeout_s,
                     )
-                    parsed = _safe_json_loads(resp.output_text)
+
+                    payload = _safe_json_loads(resp.output_text)
                     latency_ms = (time.time() - t0) * 1000.0
-                    is_err = "error" in parsed
+                    is_err = "error" in payload
+
+                    if not is_err:
+                        post_errs = _post_validate_payload(payload)
+                        if post_errs:
+                            payload["_post_validation_errors"] = post_errs
+                            # treat as error-ish but still store (your call). We mark is_err True for cache classification.
+                            is_err = True
+                            logger.error(
+                                "POST-VALIDATION FAILED | sample={} | errs={}",
+                                sample.sample_id,
+                                post_errs,
+                            )
 
                     if is_err:
                         logger.error(
-                            "API RETURNED ERROR PAYLOAD | sample={} | metric={} | latency_ms={:.1f}",
+                            "API ERROR/INVALID PAYLOAD | sample={} | latency_ms={:.1f}",
                             sample.sample_id,
-                            metric_id,
                             latency_ms,
                         )
                     else:
                         logger.info(
-                            "API OK | sample={} | metric={} | latency_ms={:.1f}",
+                            "API OK | sample={} | latency_ms={:.1f}",
                             sample.sample_id,
-                            metric_id,
                             latency_ms,
                         )
 
-                    # Store (fresh result becomes canonical for that key)
                     if use_cache and self.store.enabled:
-                        self.store.upsert(
-                            cache_key=cache_key,
-                            judge_model=self.model,
-                            metric_id=metric_id,
-                            schema_name=schema_name,
-                            sample=sample,
-                            src_image_sha256=src_image_sha256,
-                            gen_image_sha256=gen_image_sha256,
-                            system_prompt_sha256=sp_sha,
-                            user_text_sha256=ut_sha,
-                            payload=parsed,
-                            is_error=is_err,
-                            latency_ms=latency_ms,
-                            attempts=attempts_used,
-                            cache_hit=False,
-                            overwrite=True,
-                        )
+                        self.store.upsert(cache_key, payload, is_error=is_err)
                         logger.debug(
-                            "DB UPSERT | sample={} | metric={} | key={} | overwrite=1",
+                            "DB UPSERT | sample={} | key={} | is_error={}",
                             sample.sample_id,
-                            metric_id,
-                            cache_key_short,
+                            cache_short,
+                            is_err,
                         )
-                    return parsed
+
+                    return payload
 
                 except Exception as e:
                     last_exc = e
                     if attempt >= self.retry.max_retries or not self._is_retryable(e):
-                        latency_ms = (time.time() - t0) * 1000.0
-                        out = {
-                            "error": f"request_failed: {type(e).__name__}: {e}",
-                            "attempts": attempts_used,
-                        }
+                        out = {"error": f"request_failed: {type(e).__name__}: {e}"}
                         logger.error(
-                            "API FAILED (final) | sample={} | metric={} | attempts={} | latency_ms={:.1f} | err={}",
+                            "API FAILED (final) | sample={} | err={}",
                             sample.sample_id,
-                            metric_id,
-                            attempts_used,
-                            latency_ms,
                             out["error"],
                         )
                         if use_cache and self.store.enabled:
-                            self.store.upsert(
-                                cache_key=cache_key,
-                                judge_model=self.model,
-                                metric_id=metric_id,
-                                schema_name=schema_name,
-                                sample=sample,
-                                src_image_sha256=src_image_sha256,
-                                gen_image_sha256=gen_image_sha256,
-                                system_prompt_sha256=sp_sha,
-                                user_text_sha256=ut_sha,
-                                payload=out,
-                                is_error=True,
-                                latency_ms=latency_ms,
-                                attempts=attempts_used,
-                                cache_hit=False,
-                                overwrite=True,
-                            )
+                            self.store.upsert(cache_key, out, is_error=True)
                         return out
 
                     logger.warning(
-                        "API FAILED (retrying) | sample={} | metric={} | attempt={}/{} | err={}",
+                        "API FAILED (retrying) | sample={} | attempt={}/{} | err={}",
                         sample.sample_id,
-                        metric_id,
-                        attempts_used,
+                        attempt + 1,
                         self.retry.max_retries + 1,
                         f"{type(e).__name__}: {e}",
                     )
                     self._sleep_backoff(attempt, e)
 
-        out = {"error": f"request_failed_unknown: {last_exc}"}
-        logger.error(
-            "API FAILED (unknown) | sample={} | metric={} | err={}",
-            sample.sample_id,
-            metric_id,
-            out["error"],
-        )
-        if use_cache and self.store.enabled:
-            self.store.upsert(
-                cache_key=cache_key,
-                judge_model=self.model,
-                metric_id=metric_id,
-                schema_name=schema_name,
-                sample=sample,
-                src_image_sha256=src_image_sha256,
-                gen_image_sha256=gen_image_sha256,
-                system_prompt_sha256=sp_sha,
-                user_text_sha256=ut_sha,
-                payload=out,
-                is_error=True,
-                latency_ms=(time.time() - t0) * 1000.0,
-                attempts=attempts_used,
-                cache_hit=False,
-                overwrite=True,
-            )
-        return out
+        return {"error": f"request_failed_unknown: {last_exc}"}
 
 
-# -----------------------------
-# Metric base
-# -----------------------------
-
-
-class Metric:
-    metric_id: str = "base"
-    name: str = "BaseMetric"
-    needs_src_image: bool = False
-
-    def build_system_prompt(self) -> str:
-        raise NotImplementedError
-
-    def build_user_parts(self, sample: MemeSample) -> List[Dict[str, Any]]:
-        raise NotImplementedError
-
-    def schema(self) -> Tuple[str, Dict[str, Any]]:
-        raise NotImplementedError
-
-    def to_metric_result(
-        self, payload: Dict[str, Any], sample: MemeSample
-    ) -> MetricResult:
-        raise NotImplementedError
-
-    def evaluate(
-        self,
-        client: JudgeClient,
-        sample: MemeSample,
-        *,
-        use_cache: bool = True,
-        force_refresh: bool = False,
-    ) -> MetricResult:
-        schema_name, schema = self.schema()
-
-        t0 = time.time()
-        try:
-            src_sha = (
-                sha256_file(sample.src_image_path) if self.needs_src_image else None
-            )
-            gen_sha = sha256_file(sample.gen_image_path)
-
-            user_parts = self.build_user_parts(sample)
-            payload = client.run_json_schema(
-                metric_id=self.metric_id,
-                sample=sample,
-                system_prompt=self.build_system_prompt(),
-                user_parts=user_parts,
-                schema_name=schema_name,
-                schema=schema,
-                src_image_sha256=src_sha,
-                gen_image_sha256=gen_sha,
-                use_cache=use_cache,
-                force_refresh=force_refresh,
-            )
-
-            if "error" in payload:
-                return MetricResult(
-                    metric_id=self.metric_id,
-                    metric_name=self.name,
-                    score=0.0,
-                    label="error",
-                    rationale="",
-                    evidence=None,
-                    raw=payload,
-                    error=str(payload.get("error")),
-                )
-
-            result = self.to_metric_result(payload, sample)
-            return result
-
-        except Exception as e:
-            return MetricResult(
-                metric_id=self.metric_id,
-                metric_name=self.name,
-                score=0.0,
-                label="error",
-                rationale="",
-                evidence=None,
-                raw=None,
-                error=f"metric_exception: {type(e).__name__}: {e}",
-            )
-        finally:
-            elapsed_ms = (time.time() - t0) * 1000.0
-            logger.debug(
-                "METRIC DONE | sample={} | metric={} | elapsed_ms={:.1f}",
-                sample.sample_id,
-                self.metric_id,
-                elapsed_ms,
-            )
-
-
-# -----------------------------
-# Metrics
-# -----------------------------
-
-
-class TargetEmotionAccuracy(Metric):
-    metric_id = "A1_TEA"
-    name = "Target Emotion Accuracy"
-
-    def build_system_prompt(self) -> str:
-        return (
-            "You are an expert affective computing judge for memes.\n"
-            "Infer the PRIMARY emotion conveyed by the GENERATED meme.\n"
-            "Pick exactly one label from the allowed list.\n"
-            "Also report confidence (1-5).\n"
-            "Be strict: do not confuse 'less negative' with genuinely positive emotion.\n"
-            "Return JSON only."
-        )
-
-    def build_user_parts(self, sample: MemeSample) -> List[Dict[str, Any]]:
-        gen_url = image_to_data_url(sample.gen_image_path)
-        return [
-            {
-                "type": "input_text",
-                "text": (
-                    f"Allowed emotions: {', '.join(EMOTIONS_8)}\n"
-                    f"TARGET emotion: {sample.tgt_emotion}\n"
-                    "Determine the PRIMARY emotion of the GENERATED meme."
-                ),
-            },
-            {"type": "input_image", "image_url": gen_url, "detail": "high"},
-            {
-                "type": "input_text",
-                "text": "Output one allowed label and confidence 1(low)-5(high).",
-            },
-        ]
-
-    def schema(self) -> Tuple[str, Dict[str, Any]]:
-        return "tea_schema", {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "predicted_emotion": {"type": "string", "enum": EMOTIONS_8},
-                "confidence": {"type": "integer", "minimum": 1, "maximum": 5},
-                "rationale": {"type": "string"},
-            },
-            "required": ["predicted_emotion", "confidence", "rationale"],
-        }
-
-    def to_metric_result(
-        self, payload: Dict[str, Any], sample: MemeSample
-    ) -> MetricResult:
-        pred = payload["predicted_emotion"]
-        conf = int(payload["confidence"])
-        match = pred == sample.tgt_emotion
-        score = 1.0 if match else 0.0
-        label = "match" if match else "mismatch"
-        evidence = {
-            "predicted_emotion": pred,
-            "confidence": conf,
-            "target": sample.tgt_emotion,
-        }
-        return MetricResult(
-            metric_id=self.metric_id,
-            metric_name=self.name,
-            score=score,
-            label=label,
-            rationale=payload.get("rationale", ""),
-            evidence=evidence,
-            raw=payload,
-        )
-
-
-class PositiveEmotionStrength(Metric):
-    metric_id = "A2_PES"
-    name = "Positive Emotion Strength"
-
-    def build_system_prompt(self) -> str:
-        return (
-            "You are a calibrated rater of emotional intensity.\n"
-            "Rate how strongly the GENERATED meme evokes the TARGET emotion.\n"
-            "Use an integer 1-5 Likert scale.\n"
-            "Return JSON only."
-        )
-
-    def build_user_parts(self, sample: MemeSample) -> List[Dict[str, Any]]:
-        gen_url = image_to_data_url(sample.gen_image_path)
-        return [
-            {
-                "type": "input_text",
-                "text": (
-                    f"TARGET emotion: {sample.tgt_emotion}\n"
-                    "Rate intensity on 1-5:\n"
-                    "1 none, 2 weak, 3 moderate, 4 strong, 5 very strong."
-                ),
-            },
-            {"type": "input_image", "image_url": gen_url, "detail": "high"},
-        ]
-
-    def schema(self) -> Tuple[str, Dict[str, Any]]:
-        return "pes_schema", {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "likert_1_5": {"type": "integer", "minimum": 1, "maximum": 5},
-                "rationale": {"type": "string"},
-            },
-            "required": ["likert_1_5", "rationale"],
-        }
-
-    def to_metric_result(
-        self, payload: Dict[str, Any], sample: MemeSample
-    ) -> MetricResult:
-        x = int(payload["likert_1_5"])
-        score = likert_to_unit(x, 5)
-        return MetricResult(
-            metric_id=self.metric_id,
-            metric_name=self.name,
-            score=score,
-            label=f"likert_{x}",
-            rationale=payload.get("rationale", ""),
-            evidence={"likert_1_5": x},
-            raw=payload,
-        )
-
-
-class EmotionalShiftSufficiency(Metric):
-    metric_id = "A3_ESS"
-    name = "Emotional Shift Sufficiency"
-    needs_src_image = True
-
-    def build_system_prompt(self) -> str:
-        return (
-            "You are an expert judge of emotional transformation.\n"
-            "Compare SOURCE vs GENERATED memes.\n"
-            "Rate how sufficient/obvious the shift is from SOURCE emotion to TARGET emotion.\n"
-            "Use a 1-5 Likert scale; be strict about 'neutralization'.\n"
-            "Return JSON only."
-        )
-
-    def build_user_parts(self, sample: MemeSample) -> List[Dict[str, Any]]:
-        src_url = image_to_data_url(sample.src_image_path)
-        gen_url = image_to_data_url(sample.gen_image_path)
-        return [
-            {
-                "type": "input_text",
-                "text": (
-                    f"SOURCE emotion label: {sample.src_emotion}\n"
-                    f"TARGET emotion label: {sample.tgt_emotion}\n"
-                    "Likert 1-5 shift sufficiency:\n"
-                    "1 no change, 2 small, 3 moderate, 4 large, 5 very large (clear negative→target-positive)."
-                ),
-            },
-            {"type": "input_text", "text": "SOURCE image:"},
-            {"type": "input_image", "image_url": src_url, "detail": "high"},
-            {"type": "input_text", "text": "GENERATED image:"},
-            {"type": "input_image", "image_url": gen_url, "detail": "high"},
-        ]
-
-    def schema(self) -> Tuple[str, Dict[str, Any]]:
-        return "ess_schema", {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "likert_1_5": {"type": "integer", "minimum": 1, "maximum": 5},
-                "rationale": {"type": "string"},
-                "changed_cues": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "minItems": 0,
-                    "maxItems": 6,
-                },
-            },
-            "required": ["likert_1_5", "rationale", "changed_cues"],
-        }
-
-    def to_metric_result(
-        self, payload: Dict[str, Any], sample: MemeSample
-    ) -> MetricResult:
-        x = int(payload["likert_1_5"])
-        score = likert_to_unit(x, 5)
-        return MetricResult(
-            metric_id=self.metric_id,
-            metric_name=self.name,
-            score=score,
-            label=f"likert_{x}",
-            rationale=payload.get("rationale", ""),
-            evidence={"likert_1_5": x, "changed_cues": payload.get("changed_cues", [])},
-            raw=payload,
-        )
-
-
-class ScenarioConsistency(Metric):
-    metric_id = "B1_SC"
-    name = "Scenario Consistency"
-    needs_src_image = True
-
-    def build_system_prompt(self) -> str:
-        return (
-            "You are a strict meme scenario consistency checker.\n"
-            "The GENERATED meme must preserve the same underlying scenario/joke/event as SOURCE.\n"
-            "Emotion may change; scenario must not.\n"
-            "Return 1-5 Likert and a brief rationale.\n"
-            "Return JSON only."
-        )
-
-    def build_user_parts(self, sample: MemeSample) -> List[Dict[str, Any]]:
-        src_url = image_to_data_url(sample.src_image_path)
-        gen_url = image_to_data_url(sample.gen_image_path)
-
-        extra_lines: List[str] = []
-        if sample.src_caption_text:
-            extra_lines.append(f"SOURCE caption hint: {sample.src_caption_text}")
-        if sample.tgt_caption_text:
-            extra_lines.append(f"TARGET caption reference: {sample.tgt_caption_text}")
-        if sample.edit_spec:
-            extra_lines.append(f"Edit spec (reference): {sample.edit_spec}")
-        extra = ("\n" + "\n".join(extra_lines)) if extra_lines else ""
-
-        return [
-            {
-                "type": "input_text",
-                "text": (
-                    "Likert 1-5 scenario consistency:\n"
-                    "1 different scenario (changed joke/event),\n"
-                    "2 mostly different,\n"
-                    "3 mixed/unclear,\n"
-                    "4 mostly same with minor drift,\n"
-                    "5 same scenario; only emotional reframing.\n"
-                    "Compare SOURCE vs GENERATED." + extra
-                ),
-            },
-            {"type": "input_text", "text": "SOURCE image:"},
-            {"type": "input_image", "image_url": src_url, "detail": "high"},
-            {"type": "input_text", "text": "GENERATED image:"},
-            {"type": "input_image", "image_url": gen_url, "detail": "high"},
-        ]
-
-    def schema(self) -> Tuple[str, Dict[str, Any]]:
-        return "sc_schema", {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "likert_1_5": {"type": "integer", "minimum": 1, "maximum": 5},
-                "rationale": {"type": "string"},
-                "preserved_elements": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "minItems": 0,
-                    "maxItems": 6,
-                },
-                "changed_elements": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "minItems": 0,
-                    "maxItems": 6,
-                },
-            },
-            "required": [
-                "likert_1_5",
-                "rationale",
-                "preserved_elements",
-                "changed_elements",
-            ],
-        }
-
-    def to_metric_result(
-        self, payload: Dict[str, Any], sample: MemeSample
-    ) -> MetricResult:
-        x = int(payload["likert_1_5"])
-        score = likert_to_unit(x, 5)
-        return MetricResult(
-            metric_id=self.metric_id,
-            metric_name=self.name,
-            score=score,
-            label=f"likert_{x}",
-            rationale=payload.get("rationale", ""),
-            evidence={
-                "likert_1_5": x,
-                "preserved_elements": payload.get("preserved_elements", []),
-                "changed_elements": payload.get("changed_elements", []),
-            },
-            raw=payload,
-        )
-
-
-class CoreEntityPreservation(Metric):
-    metric_id = "B2_CEP"
-    name = "Core Entity Preservation"
-    needs_src_image = True
-
-    def build_system_prompt(self) -> str:
-        return (
-            "You are an identity/entity preservation auditor for image editing.\n"
-            "Judge whether the core entities (main subject/object) are preserved from SOURCE to GENERATED.\n"
-            "Return one of: yes / partial / no.\n"
-            "Return JSON only."
-        )
-
-    def build_user_parts(self, sample: MemeSample) -> List[Dict[str, Any]]:
-        src_url = image_to_data_url(sample.src_image_path)
-        gen_url = image_to_data_url(sample.gen_image_path)
-        return [
-            {
-                "type": "input_text",
-                "text": (
-                    "Entity preservation label:\n"
-                    "- yes: same main entity/identity clearly preserved\n"
-                    "- partial: mostly same but noticeable identity drift or key object replaced\n"
-                    "- no: different main entity/identity\n"
-                    "Compare SOURCE vs GENERATED."
-                ),
-            },
-            {"type": "input_text", "text": "SOURCE image:"},
-            {"type": "input_image", "image_url": src_url, "detail": "high"},
-            {"type": "input_text", "text": "GENERATED image:"},
-            {"type": "input_image", "image_url": gen_url, "detail": "high"},
-        ]
-
-    def schema(self) -> Tuple[str, Dict[str, Any]]:
-        return "cep_schema", {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "label": {"type": "string", "enum": ["yes", "partial", "no"]},
-                "rationale": {"type": "string"},
-                "main_entity": {"type": "string"},
-            },
-            "required": ["label", "rationale", "main_entity"],
-        }
-
-    def to_metric_result(
-        self, payload: Dict[str, Any], sample: MemeSample
-    ) -> MetricResult:
-        lab = payload["label"]
-        score = tri_to_unit(lab)
-        return MetricResult(
-            metric_id=self.metric_id,
-            metric_name=self.name,
-            score=score,
-            label=lab,
-            rationale=payload.get("rationale", ""),
-            evidence={"main_entity": payload.get("main_entity", "")},
-            raw=payload,
-        )
-
-
-class VisualGenerationQuality(Metric):
-    metric_id = "C1_VGQ"
-    name = "Visual Generation Quality"
-
-    def build_system_prompt(self) -> str:
-        return (
-            "You are a perceptual quality rater for image editing outputs.\n"
-            "Rate the GENERATED meme for artifacts/distortions/unnatural edits.\n"
-            "Use a 1-5 Likert. Return JSON only."
-        )
-
-    def build_user_parts(self, sample: MemeSample) -> List[Dict[str, Any]]:
-        gen_url = image_to_data_url(sample.gen_image_path)
-        return [
-            {
-                "type": "input_text",
-                "text": (
-                    "Likert 1-5 visual quality:\n"
-                    "1 unusable (severe artifacts), 2 poor, 3 acceptable, 4 good, 5 excellent/clean.\n"
-                    "Focus on: face collapse, edge artifacts (esp. around text), sudden style shifts."
-                ),
-            },
-            {"type": "input_image", "image_url": gen_url, "detail": "high"},
-        ]
-
-    def schema(self) -> Tuple[str, Dict[str, Any]]:
-        return "vgq_schema", {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "likert_1_5": {"type": "integer", "minimum": 1, "maximum": 5},
-                "rationale": {"type": "string"},
-                "defects": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "minItems": 0,
-                    "maxItems": 8,
-                },
-            },
-            "required": ["likert_1_5", "rationale", "defects"],
-        }
-
-    def to_metric_result(
-        self, payload: Dict[str, Any], sample: MemeSample
-    ) -> MetricResult:
-        x = int(payload["likert_1_5"])
-        score = likert_to_unit(x, 5)
-        return MetricResult(
-            metric_id=self.metric_id,
-            metric_name=self.name,
-            score=score,
-            label=f"likert_{x}",
-            rationale=payload.get("rationale", ""),
-            evidence={"likert_1_5": x, "defects": payload.get("defects", [])},
-            raw=payload,
-        )
-
-
-class TextRenderingQuality(Metric):
-    metric_id = "C2_TRQ"
-    name = "Text Rendering Quality"
-
-    def build_system_prompt(self) -> str:
-        return (
-            "You are a strict text-rendering quality evaluator for memes.\n"
-            "Judge whether text in the GENERATED meme is readable and intact.\n"
-            "Use a 1-5 Likert. Return JSON only."
-        )
-
-    def build_user_parts(self, sample: MemeSample) -> List[Dict[str, Any]]:
-        gen_url = image_to_data_url(sample.gen_image_path)
-        hint = (
-            f"\nTarget caption reference: {sample.tgt_caption_text}"
-            if sample.tgt_caption_text
-            else ""
-        )
-        return [
-            {
-                "type": "input_text",
-                "text": (
-                    "Likert 1-5 text quality:\n"
-                    "1 unreadable/garbled, 2 mostly unreadable, 3 partially readable, 4 mostly readable, 5 fully readable.\n"
-                    + hint
-                ),
-            },
-            {"type": "input_image", "image_url": gen_url, "detail": "high"},
-        ]
-
-    def schema(self) -> Tuple[str, Dict[str, Any]]:
-        return "trq_schema", {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "likert_1_5": {"type": "integer", "minimum": 1, "maximum": 5},
-                "rationale": {"type": "string"},
-                "issues": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "minItems": 0,
-                    "maxItems": 8,
-                },
-            },
-            "required": ["likert_1_5", "rationale", "issues"],
-        }
-
-    def to_metric_result(
-        self, payload: Dict[str, Any], sample: MemeSample
-    ) -> MetricResult:
-        x = int(payload["likert_1_5"])
-        score = likert_to_unit(x, 5)
-        label = f"likert_{x}"
-        return MetricResult(
-            metric_id=self.metric_id,
-            metric_name=self.name,
-            score=score,
-            label=label,
-            rationale=payload.get("rationale", ""),
-            evidence={
-                "likert_1_5": x,
-                "issues": payload.get("issues", []),
-            },
-            raw=payload,
-        )
-
-
-class LayoutStructureConsistency(Metric):
-    metric_id = "C3_LSC"
-    name = "Layout & Structure Consistency"
-    needs_src_image = True
-
-    def build_system_prompt(self) -> str:
-        return (
-            "You are a meme layout/structure consistency checker.\n"
-            "Compare SOURCE vs GENERATED for panel count/order and text-box placement.\n"
-            "Use 1-5 Likert. Return JSON only."
-        )
-
-    def build_user_parts(self, sample: MemeSample) -> List[Dict[str, Any]]:
-        src_url = image_to_data_url(sample.src_image_path)
-        gen_url = image_to_data_url(sample.gen_image_path)
-        return [
-            {
-                "type": "input_text",
-                "text": (
-                    "Likert 1-5 structure consistency:\n"
-                    "1 broken structure, 2 major drift, 3 moderate drift, 4 minor drift, 5 preserved.\n"
-                    "Consider: panel count, panel order, caption regions (top/bottom text boxes), text placement."
-                ),
-            },
-            {"type": "input_text", "text": "SOURCE image:"},
-            {"type": "input_image", "image_url": src_url, "detail": "high"},
-            {"type": "input_text", "text": "GENERATED image:"},
-            {"type": "input_image", "image_url": gen_url, "detail": "high"},
-        ]
-
-    def schema(self) -> Tuple[str, Dict[str, Any]]:
-        return "lsc_schema", {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "likert_1_5": {"type": "integer", "minimum": 1, "maximum": 5},
-                "rationale": {"type": "string"},
-                "mismatches": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "minItems": 0,
-                    "maxItems": 8,
-                },
-            },
-            "required": ["likert_1_5", "rationale", "mismatches"],
-        }
-
-    def to_metric_result(
-        self, payload: Dict[str, Any], sample: MemeSample
-    ) -> MetricResult:
-        x = int(payload["likert_1_5"])
-        score = likert_to_unit(x, 5)
-        return MetricResult(
-            metric_id=self.metric_id,
-            metric_name=self.name,
-            score=score,
-            label=f"likert_{x}",
-            rationale=payload.get("rationale", ""),
-            evidence={"likert_1_5": x, "mismatches": payload.get("mismatches", [])},
-            raw=payload,
-        )
-
-
-# -----------------------------
-# Metric set + aggregation
-# -----------------------------
-
-
-def default_metrics() -> List[Metric]:
-    return [
-        TargetEmotionAccuracy(),
-        PositiveEmotionStrength(),
-        EmotionalShiftSufficiency(),
-        ScenarioConsistency(),
-        CoreEntityPreservation(),
-        VisualGenerationQuality(),
-        TextRenderingQuality(),
-        LayoutStructureConsistency(),
-    ]
-
-
-def compute_ecmrq(results: List[MetricResult]) -> Dict[str, Any]:
-    by_id = {r.metric_id: r for r in results}
-
-    tea = by_id.get("A1_TEA")
-    pes = by_id.get("A2_PES")
-    ess = by_id.get("A3_ESS")
-    sc = by_id.get("B1_SC")
-    cep = by_id.get("B2_CEP")
-    vgq = by_id.get("C1_VGQ")
-    trq = by_id.get("C2_TRQ")
-    lsc = by_id.get("C3_LSC")
-
-    tea_score = tea.score if tea and tea.error is None else 0.0
-    pes_score = pes.score if (pes and pes.error is None and tea_score == 1.0) else 0.0
-    ess_score = ess.score if ess and ess.error is None else 0.0
-    axis_a = (tea_score + pes_score + ess_score) / 3.0
-
-    b_scores = []
-    if sc and sc.error is None:
-        b_scores.append(sc.score)
-    if cep and cep.error is None:
-        b_scores.append(cep.score)
-    axis_b = sum(b_scores) / len(b_scores) if b_scores else 0.0
-
-    c_scores = []
-    for x in (vgq, trq, lsc):
-        if x and x.error is None:
-            c_scores.append(x.score)
-    axis_c = sum(c_scores) / len(c_scores) if c_scores else 0.0
-
-    overall = (axis_a + axis_b + axis_c) / 3.0
-    failed = False
-    fail_reasons = []
-
-    return {
-        "failed": failed,
-        "fail_reasons": fail_reasons,
-        "axis_scores": {
-            "A_affective": axis_a,
-            "B_preservation": axis_b,
-            "C_quality": axis_c,
-        },
-        "ecmrq": overall,
-        "gating": {"PES_gated_by_TEA": True},
-    }
-
-
-# -----------------------------
-# Pipeline with concurrency + cache refresh controls
-# -----------------------------
+# =============================
+# Batch pipeline (sample-level concurrency)
+# =============================
 
 
 @dataclass
 class ConcurrencyConfig:
-    metric_workers: int = 6
     sample_workers: int = 4
-    parallel_metrics_per_sample: bool = True
 
 
 @dataclass
@@ -1492,144 +768,85 @@ class RunConfig:
     force_refresh: bool = False
 
 
-class JudgePipeline:
+class OneShotPipeline:
     def __init__(
         self,
-        client: JudgeClient,
-        metrics: Sequence[Metric],
+        client: OneShotJudgeClient,
+        cfg: OneShotConfig,
         ccfg: Optional[ConcurrencyConfig] = None,
         rcfg: Optional[RunConfig] = None,
     ):
         self.client = client
-        self.metrics = list(metrics)
+        self.cfg = cfg
         self.ccfg = ccfg or ConcurrencyConfig()
         self.rcfg = rcfg or RunConfig()
 
-    def _eval_one_metric(self, metric: Metric, sample: MemeSample) -> MetricResult:
-        return metric.evaluate(
-            self.client,
+    def evaluate_sample(self, sample: MemeSample) -> Dict[str, Any]:
+        logger.info("SAMPLE START | {}", sample.sample_id)
+        payload = self.client.judge_one_shot(
             sample,
+            self.cfg,
             use_cache=self.rcfg.use_cache,
             force_refresh=self.rcfg.force_refresh,
         )
+        logger.info("SAMPLE DONE | {}", sample.sample_id)
+        return {"sample": asdict(sample), "judge": payload}
 
-    def evaluate_sample(self, sample: MemeSample) -> SampleJudgement:
-        logger.info("SAMPLE START | {}", sample.sample_id)
-        t0 = time.time()
-
-        if not self.ccfg.parallel_metrics_per_sample or len(self.metrics) <= 1:
-            results = [self._eval_one_metric(m, sample) for m in self.metrics]
-            results.sort(key=lambda r: r.metric_id)
-            elapsed_ms = (time.time() - t0) * 1000.0
-            logger.info(
-                "SAMPLE DONE | {} | elapsed_ms={:.1f}", sample.sample_id, elapsed_ms
-            )
-            return SampleJudgement(
-                sample.sample_id, sample.src_emotion, sample.tgt_emotion, results
-            )
-
-        results: List[MetricResult] = []
-        with ThreadPoolExecutor(max_workers=self.ccfg.metric_workers) as ex:
-            futs = {
-                ex.submit(self._eval_one_metric, m, sample): m for m in self.metrics
-            }
-            for fut in as_completed(futs):
-                try:
-                    results.append(fut.result())
-                except Exception as e:
-                    m = futs[fut]
-                    logger.exception(
-                        "METRIC FUTURE FAILED | sample={} | metric={}",
-                        sample.sample_id,
-                        m.metric_id,
-                    )
-                    results.append(
-                        MetricResult(
-                            metric_id=m.metric_id,
-                            metric_name=m.name,
-                            score=0.0,
-                            label="error",
-                            rationale="",
-                            evidence=None,
-                            raw=None,
-                            error=f"metric_future_exception: {type(e).__name__}: {e}",
-                        )
-                    )
-
-        results.sort(key=lambda r: r.metric_id)
-        elapsed_ms = (time.time() - t0) * 1000.0
-        logger.info(
-            "SAMPLE DONE | {} | elapsed_ms={:.1f}", sample.sample_id, elapsed_ms
-        )
-        return SampleJudgement(
-            sample.sample_id, sample.src_emotion, sample.tgt_emotion, results
-        )
-
-    def evaluate_batch(self, samples: Sequence[MemeSample]) -> List[SampleJudgement]:
+    def evaluate_batch(self, samples: Sequence[MemeSample]) -> List[Dict[str, Any]]:
         if not samples:
             return []
         logger.info("BATCH START | n={}", len(samples))
+        out: List[Dict[str, Any]] = []
 
-        judgements: List[SampleJudgement] = []
         with ThreadPoolExecutor(max_workers=self.ccfg.sample_workers) as ex:
             futs = {ex.submit(self.evaluate_sample, s): s for s in samples}
             done = 0
             for fut in as_completed(futs):
                 s = futs[fut]
                 try:
-                    judgements.append(fut.result())
+                    out.append(fut.result())
                 except Exception as e:
                     logger.exception("SAMPLE FAILED | {}", s.sample_id)
-                    judgements.append(
-                        SampleJudgement(
-                            sample_id=s.sample_id,
-                            src_emotion=s.src_emotion,
-                            tgt_emotion=s.tgt_emotion,
-                            results=[
-                                MetricResult(
-                                    metric_id="pipeline_error",
-                                    metric_name="pipeline_error",
-                                    score=0.0,
-                                    label="error",
-                                    rationale="",
-                                    evidence=None,
-                                    raw=None,
-                                    error=f"sample_exception: {type(e).__name__}: {e}",
-                                )
-                            ],
-                        )
+                    out.append(
+                        {
+                            "sample": asdict(s),
+                            "judge": {
+                                "error": f"sample_exception: {type(e).__name__}: {e}"
+                            },
+                        }
                     )
                 done += 1
                 if done % 10 == 0 or done == len(samples):
                     logger.info("BATCH PROGRESS | {}/{}", done, len(samples))
 
-        judgements.sort(key=lambda j: j.sample_id)
-        logger.info("BATCH DONE | n={}", len(judgements))
-        return judgements
+        out.sort(key=lambda x: x["sample"]["sample_id"])
+        logger.info("BATCH DONE | n={}", len(out))
+        return out
 
 
-# -----------------------------
+# =============================
 # Example main
-# -----------------------------
+# =============================
 
 if __name__ == "__main__":
-    # Example:
-    #   LOG_LEVEL=DEBUG python mllm_judge.py
-    #   LOG_LEVEL=INFO LOG_FILE=run.log python mllm_judge.py
-    #   LOG_LEVEL=TRACE LOG_JSON=1 python mllm_judge.py
+    # Example usage:
+    #
+    # LOG_LEVEL=DEBUG python oneshot_judge.py
+    # LOG_LEVEL=INFO LOG_FILE=run.log python oneshot_judge.py
+    # LOG_LEVEL=TRACE LOG_JSON=1 python oneshot_judge.py
 
     sample = MemeSample(
         sample_id="21.png",
         src_image_path="datasets/Original/21.png",
-        src_emotion="angry",
         gen_image_path="Generated/FLUX.2-klein-4B/21.png",
+        src_emotion="angry",
         tgt_emotion="calm",
         src_caption_text="Me when the customer puts their money on the\ncounter instead of my outstretched hand\nMemeCenter.com\n",
-        tgt_caption_text='"Me when the customer smiles and thanks me while paying — what a great start to the day!"',
-        edit_spec='"Transform the dog’s squint into a calm, content expression with slightly open eyes and a gentle smile. The lighting should be warmer and softer, evoking friendliness and mutual respect."',
+        tgt_caption_text="Me when the customer smiles and thanks me while paying — what a great start to the day!",
+        edit_spec="Transform the expression into calm/content, warmer softer lighting, preserve layout and subject.",
     )
 
-    client = JudgeClient(
+    client = OneShotJudgeClient(
         model="gpt-5.2",
         retry=RetryConfig(
             max_retries=6,
@@ -1644,22 +861,19 @@ if __name__ == "__main__":
         ),
     )
 
-    pipeline = JudgePipeline(
-        client=client,
-        metrics=default_metrics(),
-        ccfg=ConcurrencyConfig(
-            metric_workers=6, sample_workers=4, parallel_metrics_per_sample=True
-        ),
-        rcfg=RunConfig(use_cache=True, force_refresh=False),
+    cfg = OneShotConfig(
+        rationale_first=True,  # global rationale ordering (ALL blocks)
+        images_first=True,  # ablation: images before or after instructions
+        temperature=0.0,
+        max_output_tokens=900,
     )
 
-    judgement = pipeline.evaluate_sample(sample)
-    summary = compute_ecmrq(judgement.results)
+    pipeline = OneShotPipeline(
+        client=client,
+        cfg=cfg,
+        ccfg=ConcurrencyConfig(sample_workers=2),
+        rcfg=RunConfig(use_cache=True, force_refresh=True),
+    )
 
-    out = {
-        "sample": asdict(sample),
-        "axis_summary": summary,
-        "aggregate_equal_metrics": judgement.aggregate(),
-        "results": [asdict(r) for r in judgement.results],
-    }
-    print(json.dumps(out, ensure_ascii=False, indent=2))
+    result = pipeline.evaluate_sample(sample)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
