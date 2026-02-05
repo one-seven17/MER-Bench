@@ -3,34 +3,20 @@
 """
 main.py
 
-Batch evaluator for meme emotion reframing:
-- Load index (json or jsonl).
-- Verify missing generations per model and filter out.
-- Filter by visual_type/sentiment_polarity/layout_type.
-- Two evaluation modes (can enable both):
-    (1) model_view: per-model metrics with uniform sampling over (visual_type,sentiment_polarity,layout_type) combinations.
-    (2) factor_view: per-factor (visual_type / sentiment_polarity / layout_type) metrics;
-                    within each factor value, per-run sample budget is evenly split across models.
-- Output per-model metric performance + (optional) cost summary (exclude cache hits).
+High-concurrency batch evaluator for meme emotion reframing.
 
-IMPORTANT:
-- This script expects your judge.py's JudgeClient.judge(...) returns (payload, cost_info).
-  payload: dict (strict JSON result)
-  cost_info: dict like:
-    {
-      "model": ...,
-      "pricing_usd_per_1m_tokens": {...} or ...,
-      "usage_tokens": {
-        "input_tokens": ...,
-        "cached_input_tokens": ...,
-        "output_tokens": ...,
-        "reasoning_tokens": ...,
-      },
-      "estimated_cost_usd": ...,
-      "latency_ms": ...,
-    }
-- Cache hits are counted by presence of payload["_cache_key"] and payload["_cached_is_error"] and no payload["error"].
-  Cost is summed ONLY when NOT cache hit.
+Behaviors (latest):
+1) Uses judge.py concurrency + retry:
+   - JudgeClient: retry + in-flight semaphore
+   - JudgePipeline: ThreadPoolExecutor concurrency
+2) factor_view and model_view are mutually exclusive.
+3) visual_type / sentiment_polarity / layout_type: each can be specified with at most ONE value, or omitted.
+4) model_view: no longer needs category-uniform sampling (filters are single-or-none).
+5) factor_view: ONLY evaluates the specified filter-combination stratum (or all if no filters).
+   - Sampling is evenly split across models each run.
+   - Aggregation is from stratum perspective (models marginalized), report mean/std/CI over runs.
+6) Supports configurable concurrency: --sample-workers and --max-in-flight.
+7) Optional cost accumulation excludes cache hits.
 """
 
 from __future__ import annotations
@@ -40,20 +26,20 @@ import json
 import os
 import random
 import sys
-from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from loguru import logger
 
-# ---- import your judge module ----
-# expects judge.py exposes these symbols
 try:
     from judge import (
         CacheConfig,
+        ConcurrencyConfig,
         JudgeClient,
         JudgeConfig,
+        JudgePipeline,
         MemeSample,
         RetryConfig,
+        RunConfig,
     )
 except Exception as e:
     raise RuntimeError(
@@ -72,7 +58,7 @@ def load_index(path: str) -> List[Dict[str, Any]]:
     Supports:
       - .json: array of objects
       - .jsonl: one JSON object per line
-    Also tolerates trailing commas in lines by best-effort stripping.
+    Tolerates trailing commas in JSONL lines.
     """
     if not os.path.exists(path):
         raise FileNotFoundError(path)
@@ -80,24 +66,18 @@ def load_index(path: str) -> List[Dict[str, Any]]:
     with open(path, "r", encoding="utf-8") as f:
         raw = f.read().strip()
 
-    # Heuristic: if starts with "[" treat as JSON array
     if raw.startswith("["):
-        try:
-            data = json.loads(raw)
-            if not isinstance(data, list):
-                raise ValueError("JSON root is not a list")
-            return data
-        except Exception as e:
-            raise ValueError(f"Failed to parse JSON array: {e}")
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            raise ValueError("JSON root is not a list")
+        return data
 
-    # Otherwise JSONL
     rows: List[Dict[str, Any]] = []
     with open(path, "r", encoding="utf-8") as f2:
         for ln, line in enumerate(f2, start=1):
             s = line.strip()
             if not s:
                 continue
-            # tolerate trailing commas like: {...},
             if s.endswith(","):
                 s = s[:-1].rstrip()
             try:
@@ -112,29 +92,19 @@ def load_index(path: str) -> List[Dict[str, Any]]:
 
 
 # =============================
-# Filtering / grouping helpers
+# Filtering helpers (single-or-none)
 # =============================
 
 
-def key3(row: Dict[str, Any]) -> Tuple[str, str, str]:
-    return (
-        str(row.get("visual_type", "")),
-        str(row.get("sentiment_polarity", "")),
-        str(row.get("layout_type", "")),
-    )
+def _match_single(value: str, selected: Optional[str]) -> bool:
+    return True if selected is None else value == selected
 
 
-def match_optional(value: str, allowed: Optional[Sequence[str]]) -> bool:
-    if not allowed:
-        return True
-    return value in set(allowed)
-
-
-def filter_rows(
+def filter_rows_single(
     rows: Sequence[Dict[str, Any]],
-    visual_type: Optional[Sequence[str]],
-    sentiment_polarity: Optional[Sequence[str]],
-    layout_type: Optional[Sequence[str]],
+    visual_type: Optional[str],
+    sentiment_polarity: Optional[str],
+    layout_type: Optional[str],
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for r in rows:
@@ -142,23 +112,24 @@ def filter_rows(
         sp = str(r.get("sentiment_polarity", ""))
         lt = str(r.get("layout_type", ""))
         if (
-            match_optional(vt, visual_type)
-            and match_optional(sp, sentiment_polarity)
-            and match_optional(lt, layout_type)
+            _match_single(vt, visual_type)
+            and _match_single(sp, sentiment_polarity)
+            and _match_single(lt, layout_type)
         ):
             out.append(r)
     return out
 
 
 def aggregate_counts(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Aggregates by visual_type/sentiment_polarity/layout_type.
-    """
     agg: Dict[Tuple[str, str, str], int] = {}
     for r in rows:
-        k = key3(r)
+        k = (
+            str(r.get("visual_type", "")),
+            str(r.get("sentiment_polarity", "")),
+            str(r.get("layout_type", "")),
+        )
         agg[k] = agg.get(k, 0) + 1
-    # convert keys to json-friendly
+
     return {
         "by_visual_type_sentiment_layout": [
             {
@@ -172,76 +143,16 @@ def aggregate_counts(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def group_rows_by_key3(
-    rows: Sequence[Dict[str, Any]],
-) -> Dict[Tuple[str, str, str], List[Dict[str, Any]]]:
-    g: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
-    for r in rows:
-        g.setdefault(key3(r), []).append(r)
-    return g
-
-
-def allocate_quota(total: int, n_buckets: int, rng: random.Random) -> List[int]:
-    """
-    Evenly allocate 'total' items into 'n_buckets' buckets.
-    Any remainder is randomly distributed to buckets.
-    """
-    if n_buckets <= 0:
-        return []
-    base = total // n_buckets
-    rem = total - base * n_buckets
-    q = [base] * n_buckets
-    if rem > 0:
-        idxs = list(range(n_buckets))
-        rng.shuffle(idxs)
-        for i in range(rem):
-            q[idxs[i]] += 1
-    return q
-
-
-def sample_uniform_over_groups(
-    rows: Sequence[Dict[str, Any]], sample_size: int, rng: random.Random
-) -> List[Dict[str, Any]]:
-    """
-    Uniform sampling over key3 groups (visual_type, sentiment_polarity, layout_type).
-    - Allocate sample_size evenly across groups.
-    - Within each group, sample without replacement if enough; else sample with replacement.
-    """
-    if sample_size <= 0:
-        return []
-    groups = group_rows_by_key3(rows)
-    if not groups:
-        return []
-
-    keys = list(groups.keys())
-    quotas = allocate_quota(sample_size, len(keys), rng)
-    out: List[Dict[str, Any]] = []
-
-    for k, q in zip(keys, quotas):
-        if q <= 0:
-            continue
-        bucket = groups[k]
-        if len(bucket) >= q:
-            out.extend(rng.sample(bucket, k=q))
-        else:
-            out.extend([rng.choice(bucket) for _ in range(q)])
-
-    rng.shuffle(out)
-    return out
-
-
 # =============================
-# Path + missing checks
+# Missing checks
 # =============================
 
 
 def build_src_path(src_dir: str, row: Dict[str, Any]) -> str:
-    # index field: id
     return os.path.join(src_dir, str(row["id"]))
 
 
 def build_gen_path(gen_root: str, model: str, row: Dict[str, Any]) -> str:
-    # index field: gen_id
     return os.path.join(gen_root, model, str(row["gen_id"]))
 
 
@@ -251,17 +162,12 @@ def verify_missing(
     gen_root: str,
     models: Sequence[str],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Returns (kept_rows, report)
-    - A row is kept only if:
-        - SOURCE exists
-        - for each requested model, GENERATED exists
-    """
     kept: List[Dict[str, Any]] = []
     missing_report: Dict[str, Any] = {
         "missing_source": 0,
         "missing_by_model": {m: 0 for m in models},
         "missing_examples": {m: [] for m in models},
+        "total": len(rows),
     }
 
     for r in rows:
@@ -290,12 +196,11 @@ def verify_missing(
         kept.append(r)
 
     missing_report["kept"] = len(kept)
-    missing_report["total"] = len(rows)
     return kept, missing_report
 
 
 # =============================
-# Metric extraction / scoring
+# Metrics extraction
 # =============================
 
 
@@ -321,19 +226,6 @@ def safe_get(d: Dict[str, Any], *path: str) -> Any:
 
 
 def extract_metrics(payload: Dict[str, Any], tgt_emotion: str) -> Dict[str, float]:
-    """
-    Normalize to numeric scores where applicable.
-
-    Assumes judge schema:
-      - visual_assessment.generation_quality_1_5
-      - visual_assessment.emotion_accuracy_1_5
-      - text_assessment.generation_quality_1_5
-      - text_assessment.emotion_accuracy_1_5
-      - layout_consistency.consistent
-      - overall_emotion_classification.label (+ other_emotion)
-      - perceived_emotion_shift.magnitude_1_5
-      - overall_generation_quality.overall_generation_quality_1_5
-    """
     out: Dict[str, float] = {}
 
     vq = safe_get(payload, "visual_assessment", "generation_quality_1_5")
@@ -348,9 +240,8 @@ def extract_metrics(payload: Dict[str, Any], tgt_emotion: str) -> Dict[str, floa
     )
 
     def to_1_5(x: Any) -> Optional[float]:
-        if isinstance(x, (int, float)):
-            if 1 <= float(x) <= 5:
-                return float(x)
+        if isinstance(x, (int, float)) and 1 <= float(x) <= 5:
+            return float(x)
         return None
 
     out["visual_generation_quality_1_5"] = to_1_5(vq) or 0.0
@@ -360,12 +251,7 @@ def extract_metrics(payload: Dict[str, Any], tgt_emotion: str) -> Dict[str, floa
     out["perceived_emotion_shift_1_5"] = to_1_5(shift) or 0.0
     out["overall_generation_quality_1_5"] = to_1_5(oq) or 0.0
 
-    if isinstance(lc, bool):
-        out["layout_consistency_accuracy"] = 1.0 if lc else 0.0
-    else:
-        out["layout_consistency_accuracy"] = 0.0
-
-    # classification hit wrt tgt_emotion (target-gated)
+    out["layout_consistency_accuracy"] = 1.0 if isinstance(lc, bool) and lc else 0.0
     out["tgt_emotion_hit"] = (
         1.0 if (isinstance(cls_label, str) and cls_label == tgt_emotion) else 0.0
     )
@@ -374,16 +260,11 @@ def extract_metrics(payload: Dict[str, Any], tgt_emotion: str) -> Dict[str, floa
 
 
 # =============================
-# Cost / cache helpers
+# Cache / Cost helpers
 # =============================
 
 
 def cache_flag(payload: Dict[str, Any]) -> bool:
-    """
-    Your SQLiteStore marks:
-      payload["_cache_key"], payload["_cached_is_error"]
-    We treat it as cache-hit if those keys exist AND there's no "error" in payload.
-    """
     if "error" in payload:
         return False
     return ("_cache_key" in payload) and ("_cached_is_error" in payload)
@@ -397,23 +278,64 @@ def extract_cost_usd_from_cost_info(cost_info: Optional[Dict[str, Any]]) -> floa
 
 
 # =============================
-# Evaluation runner
+# Sampling utilities
+# =============================
+
+
+def allocate_quota(total: int, n_buckets: int, rng: random.Random) -> List[int]:
+    if n_buckets <= 0:
+        return []
+    base = total // n_buckets
+    rem = total - base * n_buckets
+    q = [base] * n_buckets
+    if rem > 0:
+        idxs = list(range(n_buckets))
+        rng.shuffle(idxs)
+        for i in range(rem):
+            q[idxs[i]] += 1
+    return q
+
+
+def sample_rows(
+    rows: Sequence[Dict[str, Any]], k: int, rng: random.Random
+) -> List[Dict[str, Any]]:
+    if k <= 0:
+        return []
+    if not rows:
+        return []
+    if len(rows) >= k:
+        return rng.sample(list(rows), k=k)
+    return [rng.choice(list(rows)) for _ in range(k)]
+
+
+# =============================
+# Sample builder (embed model in sample_id for bookkeeping)
 # =============================
 
 
 def make_sample(
     src_dir: str, gen_root: str, model: str, row: Dict[str, Any]
 ) -> MemeSample:
+    row_id = str(row.get("id"))
     return MemeSample(
-        sample_id=str(row.get("id")),
-        src_image_path=build_src_path(src_dir, row),
-        gen_image_path=build_gen_path(gen_root, model, row),
+        sample_id=f"{row_id}::{model}",
+        src_image_path=os.path.join(src_dir, row_id),
+        gen_image_path=os.path.join(gen_root, model, str(row.get("gen_id"))),
         src_emotion=str(row.get("det_emo", "")),
         tgt_emotion=str(row.get("tgt_emo", "")),
         src_caption_text=row.get("text"),
         tgt_caption_text=row.get("pos_txt"),
         edit_instruction=row.get("spec"),
     )
+
+
+def parse_model_from_sample_id(sample_id: str) -> str:
+    return sample_id.split("::", 1)[1] if "::" in sample_id else ""
+
+
+# =============================
+# Stats
+# =============================
 
 
 def mean(xs: Sequence[float]) -> float:
@@ -428,9 +350,6 @@ def std(xs: Sequence[float]) -> float:
 
 
 def ci95_of_replicates(xs: Sequence[float]) -> Tuple[float, float]:
-    """
-    Simple percentile CI across replicate means.
-    """
     if not xs:
         return 0.0, 0.0
     ys = sorted(xs)
@@ -439,11 +358,12 @@ def ci95_of_replicates(xs: Sequence[float]) -> Tuple[float, float]:
     return lo, hi
 
 
-def _init_rep_struct(models: Sequence[str]) -> Dict[str, Dict[str, List[float]]]:
-    return {m: {k: [] for k in METRIC_KEYS} for m in models}
+# =============================
+# Evaluation modes
+# =============================
 
 
-def _init_book_struct(models: Sequence[str]) -> Dict[str, Any]:
+def init_book(models: Sequence[str]) -> Dict[str, Any]:
     return {
         "per_model": {
             m: {"api_calls": 0, "cache_hits": 0, "cost_usd": 0.0, "errors": 0}
@@ -452,218 +372,218 @@ def _init_book_struct(models: Sequence[str]) -> Dict[str, Any]:
     }
 
 
-def _update_bookkeeping(
+def update_book(
     book: Dict[str, Any],
-    m: str,
+    model: str,
     payload: Dict[str, Any],
     cost_info: Optional[Dict[str, Any]],
     compute_cost: bool,
 ) -> None:
+    # init per_model
+    if "per_model" not in book:
+        book["per_model"] = {}
+
+    if model not in book["per_model"]:
+        book["per_model"][model] = {
+            "api_calls": 0,
+            "cache_hits": 0,
+            "cost_usd": 0.0,
+            "errors": 0,
+        }
+
+    # init overall
+    if "overall" not in book:
+        book["overall"] = {
+            "api_calls": 0,
+            "cache_hits": 0,
+            "cost_usd": 0.0,
+            "errors": 0,
+        }
+
+    # error
     if "error" in payload:
-        book["per_model"][m]["errors"] += 1
+        book["per_model"][model]["errors"] += 1
+        book["overall"]["errors"] += 1
         return
 
+    # cache hit (no cost)
     if cache_flag(payload):
-        book["per_model"][m]["cache_hits"] += 1
-    else:
-        book["per_model"][m]["api_calls"] += 1
-        if compute_cost:
-            book["per_model"][m]["cost_usd"] += extract_cost_usd_from_cost_info(
-                cost_info
-            )
+        book["per_model"][model]["cache_hits"] += 1
+        book["overall"]["cache_hits"] += 1
+        return
+
+    # api call
+    book["per_model"][model]["api_calls"] += 1
+    book["overall"]["api_calls"] += 1
+
+    if compute_cost:
+        c = extract_cost_usd_from_cost_info(cost_info)
+        book["per_model"][model]["cost_usd"] += c
+        book["overall"]["cost_usd"] += c
 
 
-def _summarize_rep_means(
-    rep_means: Dict[str, Dict[str, List[float]]], runs: int
+def evaluate_model_view(
+    *,
+    rows: Sequence[Dict[str, Any]],
+    models: Sequence[str],
+    src_dir: str,
+    gen_root: str,
+    pipeline: JudgePipeline,
+    runs: int,
+    sample_size: int,
+    seed: int,
+    compute_cost: bool,
 ) -> Dict[str, Any]:
-    summary: Dict[str, Any] = {"models": {}}
-    for m, mmetrics in rep_means.items():
+    rng = random.Random(seed)
+
+    rep_means: Dict[str, Dict[str, List[float]]] = {
+        m: {k: [] for k in METRIC_KEYS} for m in models
+    }
+    book = init_book(models)
+
+    for r_i in range(runs):
+        batch_rows = sample_rows(rows, k=sample_size, rng=rng)
+
+        samples: List[MemeSample] = []
+        tgt_by_sample_id: Dict[str, str] = {}
+        for row in batch_rows:
+            for m in models:
+                s = make_sample(src_dir, gen_root, m, row)
+                samples.append(s)
+                tgt_by_sample_id[s.sample_id] = str(row.get("tgt_emo", ""))
+
+        results = pipeline.evaluate_batch(samples)
+
+        run_vals: Dict[str, Dict[str, List[float]]] = {
+            m: {k: [] for k in METRIC_KEYS} for m in models
+        }
+
+        for item in results:
+            sample_obj = item.get("sample", {})
+            sample_id = str(sample_obj.get("sample_id", ""))
+            model = parse_model_from_sample_id(sample_id)
+            payload = item.get("judge", {}) if isinstance(item, dict) else {}
+            cost_info = item.get("cost") if isinstance(item, dict) else None
+
+            update_book(book, model, payload, cost_info, compute_cost)
+            if not isinstance(payload, dict) or "error" in payload:
+                continue
+
+            tgt = tgt_by_sample_id.get(sample_id, "")
+            metrics = extract_metrics(payload, tgt)
+            for kk, vv in metrics.items():
+                run_vals[model][kk].append(float(vv))
+
+        for m in models:
+            for kk in METRIC_KEYS:
+                rep_means[m][kk].append(mean(run_vals[m][kk]))
+
+        logger.info("[model_view] Run {}/{} done.", r_i + 1, runs)
+
+    summary: Dict[str, Any] = {"models": {}, "bookkeeping": book}
+    for m in models:
         mm: Dict[str, Any] = {}
-        for k, xs in mmetrics.items():
-            mm[k] = {
+        for kk in METRIC_KEYS:
+            xs = rep_means[m][kk]
+            mm[kk] = {
                 "mean_over_runs": mean(xs),
                 "std_over_runs": std(xs),
                 "ci95_over_runs": list(ci95_of_replicates(xs)),
                 "runs": runs,
             }
         summary["models"][m] = mm
+
     return summary
 
 
-def evaluate_models(
+def evaluate_factor_view_stratum(
     *,
     rows: Sequence[Dict[str, Any]],
     models: Sequence[str],
     src_dir: str,
     gen_root: str,
-    client: JudgeClient,
-    cfg: JudgeConfig,
+    pipeline: JudgePipeline,
     runs: int,
     sample_size: int,
     seed: int,
     compute_cost: bool,
-    use_cache: bool,
-    force_refresh: bool,
-    mode_model_view: bool,
-    mode_factor_view: bool,
+    stratum_label: Dict[str, Optional[str]],
 ) -> Dict[str, Any]:
+    """
+    factor_view (models marginalized), but ONLY for the given stratum:
+      - rows passed in are already filtered to the specified combination (single-or-none).
+      - Each run: split sample_size evenly across models, sample rows, evaluate, pool metrics across models.
+      - Over runs: mean/std/CI of pooled means.
+    """
     rng = random.Random(seed)
 
-    if sample_size <= 0:
-        raise ValueError("--sample-size must be > 0")
-    if runs <= 0:
-        raise ValueError("--runs must be > 0")
+    rep_means: Dict[str, List[float]] = {k: [] for k in METRIC_KEYS}
+    book = init_book(models)
 
-    out: Dict[str, Any] = {}
+    for r_i in range(runs):
+        quotas = allocate_quota(sample_size, len(models), rng)
 
-    # -------------------------
-    # Mode 1: model_view
-    # -------------------------
-    if mode_model_view:
-        model_view_rep_means = _init_rep_struct(models)
-        model_view_book = _init_book_struct(models)
+        samples: List[MemeSample] = []
+        tgt_by_sample_id: Dict[str, str] = {}
 
-        for r_i in range(runs):
-            # uniform over key3 combinations (visual_type, sentiment_polarity, layout_type)
-            batch = sample_uniform_over_groups(rows, sample_size=sample_size, rng=rng)
+        for m, q in zip(models, quotas):
+            mbatch = sample_rows(rows, k=q, rng=rng)
+            for row in mbatch:
+                s = make_sample(src_dir, gen_root, m, row)
+                samples.append(s)
+                tgt_by_sample_id[s.sample_id] = str(row.get("tgt_emo", ""))
 
-            rep_vals = _init_rep_struct(models)
+        results = pipeline.evaluate_batch(samples)
 
-            for row in batch:
-                tgt = str(row.get("tgt_emo", ""))
+        pooled_vals: Dict[str, List[float]] = {k: [] for k in METRIC_KEYS}
 
-                for m in models:
-                    sample = make_sample(src_dir, gen_root, m, row)
-                    payload, cost_info = client.judge(
-                        sample,
-                        cfg,
-                        use_cache=use_cache,
-                        force_refresh=force_refresh,
-                    )
+        for item in results:
+            sample_obj = item.get("sample", {})
+            sample_id = str(sample_obj.get("sample_id", ""))
+            model = parse_model_from_sample_id(sample_id)
+            payload = item.get("judge", {}) if isinstance(item, dict) else {}
+            cost_info = item.get("cost") if isinstance(item, dict) else None
 
-                    _update_bookkeeping(
-                        model_view_book, m, payload, cost_info, compute_cost
-                    )
-                    if "error" in payload:
-                        continue
+            update_book(book, model, payload, cost_info, compute_cost)
+            if not isinstance(payload, dict) or "error" in payload:
+                continue
 
-                    metrics = extract_metrics(payload, tgt)
-                    for k, v in metrics.items():
-                        rep_vals[m][k].append(float(v))
+            tgt = tgt_by_sample_id.get(sample_id, "")
+            metrics = extract_metrics(payload, tgt)
+            for kk, vv in metrics.items():
+                pooled_vals[kk].append(float(vv))
 
-            for m in models:
-                for k in METRIC_KEYS:
-                    model_view_rep_means[m][k].append(mean(rep_vals[m][k]))
+        for kk in METRIC_KEYS:
+            rep_means[kk].append(mean(pooled_vals[kk]))
 
-            logger.info("[model_view] Run {}/{} done.", r_i + 1, runs)
+        logger.info(
+            "[factor_view:stratum] Run {}/{} done. (n_samples={}, n_models={})",
+            r_i + 1,
+            runs,
+            len(samples),
+            len(models),
+        )
 
-        out["model_view"] = _summarize_rep_means(model_view_rep_means, runs=runs)
-        out["model_view"]["bookkeeping"] = model_view_book
-
-    # -------------------------
-    # Mode 2: factor_view
-    # -------------------------
-    if mode_factor_view:
-
-        def factor_groups(
-            rows_: Sequence[Dict[str, Any]], factor: str
-        ) -> Dict[str, List[Dict[str, Any]]]:
-            g: Dict[str, List[Dict[str, Any]]] = {}
-            for rr in rows_:
-                v = str(rr.get(factor, ""))
-                g.setdefault(v, []).append(rr)
-            return g
-
-        vt_groups = factor_groups(rows, "visual_type")
-        sp_groups = factor_groups(rows, "sentiment_polarity")
-        lt_groups = factor_groups(rows, "layout_type")
-
-        factor_view: Dict[str, Any] = {
-            "visual_type": {},
-            "sentiment_polarity": {},
-            "layout_type": {},
+    metrics_summary: Dict[str, Any] = {}
+    for kk, xs in rep_means.items():
+        metrics_summary[kk] = {
+            "mean_over_runs": mean(xs),
+            "std_over_runs": std(xs),
+            "ci95_over_runs": list(ci95_of_replicates(xs)),
+            "runs": runs,
         }
 
-        def eval_one_factor_set(
-            groups: Dict[str, List[Dict[str, Any]]], factor_name: str
-        ) -> Dict[str, Any]:
-            result: Dict[str, Any] = {}
-
-            for fv, grows in groups.items():
-                rep_means = _init_rep_struct(models)
-                book = _init_book_struct(models)
-
-                for r_i in range(runs):
-                    # per-run sample_size budget split evenly across models
-                    mquotas = allocate_quota(sample_size, len(models), rng)
-                    mquota_map = {m: q for m, q in zip(models, mquotas)}
-
-                    rep_vals = _init_rep_struct(models)
-
-                    for m in models:
-                        q = mquota_map[m]
-                        if q <= 0:
-                            continue
-
-                        if len(grows) >= q:
-                            gbatch = rng.sample(grows, k=q)
-                        else:
-                            gbatch = [rng.choice(grows) for _ in range(q)]
-
-                        for row in gbatch:
-                            tgt = str(row.get("tgt_emo", ""))
-
-                            sample = make_sample(src_dir, gen_root, m, row)
-                            payload, cost_info = client.judge(
-                                sample,
-                                cfg,
-                                use_cache=use_cache,
-                                force_refresh=force_refresh,
-                            )
-
-                            _update_bookkeeping(
-                                book, m, payload, cost_info, compute_cost
-                            )
-                            if "error" in payload:
-                                continue
-
-                            metrics = extract_metrics(payload, tgt)
-                            for kk, vv in metrics.items():
-                                rep_vals[m][kk].append(float(vv))
-
-                    for m in models:
-                        for kk in METRIC_KEYS:
-                            rep_means[m][kk].append(mean(rep_vals[m][kk]))
-
-                summarized = _summarize_rep_means(rep_means, runs=runs)
-                summarized["bookkeeping"] = book
-
-                # macro-average across models for quick comparison
-                macro: Dict[str, Any] = {}
-                for kk in METRIC_KEYS:
-                    model_means = [
-                        summarized["models"][m][kk]["mean_over_runs"] for m in models
-                    ]
-                    macro[kk] = {
-                        "mean_over_models": mean(model_means),
-                        "models": len(models),
-                    }
-                summarized["macro_over_models"] = macro
-
-                result[fv] = summarized
-                logger.info("[factor_view:{}={}] done.", factor_name, fv)
-
-            return result
-
-        factor_view["visual_type"] = eval_one_factor_set(vt_groups, "visual_type")
-        factor_view["sentiment_polarity"] = eval_one_factor_set(
-            sp_groups, "sentiment_polarity"
-        )
-        factor_view["layout_type"] = eval_one_factor_set(lt_groups, "layout_type")
-
-        out["factor_view"] = factor_view
-
-    return out
+    return {
+        "stratum": stratum_label,
+        "group_size": len(rows),
+        "models_marginalized": True,
+        "metrics": metrics_summary,
+        "bookkeeping": book,
+        "sampling": {
+            "sample_size_per_run_total": sample_size,
+            "even_split_over_models": True,
+        },
+    }
 
 
 # =============================
@@ -671,21 +591,33 @@ def evaluate_models(
 # =============================
 
 
+def _enforce_single_or_none(name: str, values: Optional[List[str]]) -> Optional[str]:
+    if not values:
+        return None
+    if len(values) != 1:
+        raise ValueError(
+            f"--{name} can specify at most ONE value (or omit it). Got: {values}"
+        )
+    return values[0]
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Evaluate meme emotion reframing outputs (per model)."
+        description="Evaluate meme emotion reframing outputs with high concurrency."
     )
 
     p.add_argument(
-        "--index", required=True, help="Path to index file (.json or .jsonl)."
+        "--index",
+        default="./data/index_final.json",
+        help="Path to index file (.json or .jsonl).",
     )
     p.add_argument(
-        "--src-dir", required=True, help="Directory of original/source images."
+        "--src-dir", default="./data/Original", help="Directory of source images."
     )
     p.add_argument(
         "--gen-root",
-        required=True,
-        help="Root directory of generated images. Subdirs are model names.",
+        default="./data/EditedResults",
+        help="Root directory of generated images (subdirs are model names).",
     )
 
     p.add_argument(
@@ -699,31 +631,31 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--visual-type",
         nargs="*",
         default=None,
-        help="Filter: allowed visual_type values.",
+        help="Filter: ONE visual_type value (or omit).",
     )
     p.add_argument(
         "--sentiment-polarity",
         nargs="*",
         default=None,
-        help="Filter: allowed sentiment_polarity values.",
+        help="Filter: ONE sentiment_polarity value (or omit).",
     )
     p.add_argument(
         "--layout-type",
         nargs="*",
         default=None,
-        help="Filter: allowed layout_type values.",
+        help="Filter: ONE layout_type value (or omit).",
     )
 
     p.add_argument(
-        "--runs",
-        type=int,
-        default=10,
-        help="Number of repeated subsampling runs (default 10).",
+        "--runs", type=int, default=10, help="Number of repeated runs (default 10)."
     )
     p.add_argument(
-        "--sample-size", type=int, default=50, help="Sample size per run (default 50)."
+        "--sample-size",
+        type=int,
+        default=50,
+        help="Total sample size per run (default 50).",
     )
-    p.add_argument("--seed", type=int, default=0, help="Random seed (default 0).")
+    p.add_argument("--seed", type=int, default=42, help="Random seed (default 42).")
 
     p.add_argument(
         "--use-cache", action="store_true", help="Enable SQLite cache read/write."
@@ -733,51 +665,64 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Force API refresh even if cache exists.",
     )
-
     p.add_argument("--db", default="db.sqlite3", help="SQLite cache db path.")
+
     p.add_argument(
-        "--model", default="gpt-5.2", help="Judge model name (default gpt-5.2)."
+        "--judge-model", default="gpt-5.2", help="Judge model name (default gpt-5.2)."
     )
     p.add_argument("--max-output-tokens", type=int, default=900)
     p.add_argument("--temperature", type=float, default=0.0)
 
     p.add_argument(
-        "--rationale-first",
-        action="store_true",
-        help="Rationales first in schema (global).",
+        "--rationale-first", action="store_true", help="Rationales first in schema."
     )
     p.add_argument(
-        "--rationale-last",
-        action="store_true",
-        help="Rationales last in schema (global).",
+        "--rationale-last", action="store_true", help="Rationales last in schema."
     )
     p.add_argument(
-        "--images-first",
-        action="store_true",
-        help="Images before instruction text (ablation).",
+        "--images-first", action="store_true", help="Images before instruction text."
     )
     p.add_argument(
-        "--images-last",
-        action="store_true",
-        help="Images after instruction text (ablation).",
+        "--images-last", action="store_true", help="Images after instruction text."
     )
 
     p.add_argument(
         "--compute-cost",
         action="store_true",
-        help="Include cost summary (exclude cache hits).",
+        help="Include cost sum (exclude cache hits).",
     )
 
-    # === MOD: modes (can enable both) ===
-    p.add_argument(
-        "--mode-model-view",
-        action="store_true",
-        help="Mode 1: per-model metrics with uniform sampling over (visual_type,sentiment_polarity,layout_type) combinations.",
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument(
+        "--mode-model-view", action="store_true", help="Run model_view only."
     )
-    p.add_argument(
+    g.add_argument(
         "--mode-factor-view",
         action="store_true",
-        help="Mode 2: per-factor (visual_type / sentiment_polarity / layout_type) metrics; within each factor value, sample budget is evenly split across models.",
+        help="Run factor_view only (only specified stratum; models marginalized).",
+    )
+
+    p.add_argument(
+        "--sample-workers",
+        type=int,
+        default=64,
+        help="Pipeline sample-level worker threads (default 64).",
+    )
+    p.add_argument(
+        "--max-in-flight",
+        type=int,
+        default=128,
+        help="Client max in-flight requests (default 128).",
+    )
+
+    p.add_argument(
+        "--timeout-s",
+        type=float,
+        default=120.0,
+        help="Per-request timeout seconds (default 120).",
+    )
+    p.add_argument(
+        "--max-retries", type=int, default=6, help="Max retries (default 6)."
     )
 
     p.add_argument(
@@ -794,42 +739,44 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.remove()
     logger.add(sys.stderr, level=str(args.log_level).upper())
 
-    # config switches
-    rationale_first = True
+    # enforce single-or-none filters
+    try:
+        visual_type = _enforce_single_or_none("visual-type", args.visual_type)
+        sentiment_polarity = _enforce_single_or_none(
+            "sentiment-polarity", args.sentiment_polarity
+        )
+        layout_type = _enforce_single_or_none("layout-type", args.layout_type)
+    except ValueError as e:
+        logger.error(str(e))
+        return 2
+
     if args.rationale_first and args.rationale_last:
         logger.error("Choose only one: --rationale-first or --rationale-last")
         return 2
-    if args.rationale_last:
-        rationale_first = False
+    rationale_first = False if args.rationale_last else True
 
-    images_first = True
     if args.images_first and args.images_last:
         logger.error("Choose only one: --images-first or --images-last")
         return 2
-    if args.images_last:
-        images_first = False
+    images_first = False if args.images_last else True
 
-    # === MOD: mode defaults ===
-    mode_model_view = bool(args.mode_model_view)
-    mode_factor_view = bool(args.mode_factor_view)
-    if not mode_model_view and not mode_factor_view:
-        mode_model_view = True  # default
+    if args.sample_size <= 0 or args.runs <= 0:
+        logger.error("--sample-size and --runs must be > 0")
+        return 2
 
     # load index
     rows_all = load_index(args.index)
     logger.info("Loaded index rows: {}", len(rows_all))
-
-    # aggregate overview BEFORE missing filter
     overview_before = aggregate_counts(rows_all)
 
-    # filter by fields (before missing check)
-    rows_filtered = filter_rows(
+    # filter to the specified stratum (single-or-none)
+    rows_filtered = filter_rows_single(
         rows_all,
-        visual_type=args.visual_type,
-        sentiment_polarity=args.sentiment_polarity,
-        layout_type=args.layout_type,
+        visual_type=visual_type,
+        sentiment_polarity=sentiment_polarity,
+        layout_type=layout_type,
     )
-    logger.info("After field filters: {}", len(rows_filtered))
+    logger.info("After field filters (stratum): {}", len(rows_filtered))
 
     # verify missing for requested models
     rows_kept, missing_report = verify_missing(
@@ -841,96 +788,136 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ):
         logger.warning("Missing report: {}", missing_report)
 
-    # aggregate overview AFTER missing filter
     overview_after = aggregate_counts(rows_kept)
+    if not rows_kept:
+        logger.error("No samples left after filtering + missing-check.")
+        return 1
 
-    # build judge client
+    # build client + pipeline
     client = JudgeClient(
-        model=args.model,
-        retry=RetryConfig(timeout_s=120),
-        max_in_flight=8,
+        model=args.judge_model,
+        retry=RetryConfig(
+            max_retries=int(args.max_retries),
+            timeout_s=float(args.timeout_s),
+        ),
+        max_in_flight=int(args.max_in_flight),
         cache=CacheConfig(
             enabled=bool(args.use_cache),
-            db_path=args.db,
+            db_path=str(args.db),
             return_cached_errors=False,
         ),
     )
 
     cfg = JudgeConfig(
-        rationale_first=rationale_first,
-        images_first=images_first,
+        rationale_first=bool(rationale_first),
+        images_first=bool(images_first),
         temperature=float(args.temperature),
         max_output_tokens=int(args.max_output_tokens),
     )
+    # align judge-side cost enablement
+    try:
+        cfg.cost.enabled = bool(args.compute_cost)
+    except Exception:
+        pass
 
-    # evaluate
-    summary = evaluate_models(
-        rows=rows_kept,
-        models=args.models,
-        src_dir=args.src_dir,
-        gen_root=args.gen_root,
+    pipeline = JudgePipeline(
         client=client,
         cfg=cfg,
-        runs=int(args.runs),
-        sample_size=int(args.sample_size),
-        seed=int(args.seed),
-        compute_cost=bool(args.compute_cost),
-        use_cache=bool(args.use_cache),
-        force_refresh=bool(args.force_refresh),
-        mode_model_view=mode_model_view,
-        mode_factor_view=mode_factor_view,
+        ccfg=ConcurrencyConfig(sample_workers=int(args.sample_workers)),
+        rcfg=RunConfig(
+            use_cache=bool(args.use_cache),
+            force_refresh=bool(args.force_refresh),
+        ),
     )
 
-    out_obj = {
+    # evaluate (exclusive mode)
+    if args.mode_model_view:
+        results = {
+            "model_view": evaluate_model_view(
+                rows=rows_kept,
+                models=args.models,
+                src_dir=args.src_dir,
+                gen_root=args.gen_root,
+                pipeline=pipeline,
+                runs=int(args.runs),
+                sample_size=int(args.sample_size),
+                seed=int(args.seed),
+                compute_cost=bool(args.compute_cost),
+            )
+        }
+        mode = "model_view"
+    else:
+        stratum_label = {
+            "visual_type": visual_type,
+            "sentiment_polarity": sentiment_polarity,
+            "layout_type": layout_type,
+        }
+        results = {
+            "factor_view": evaluate_factor_view_stratum(
+                rows=rows_kept,
+                models=args.models,
+                src_dir=args.src_dir,
+                gen_root=args.gen_root,
+                pipeline=pipeline,
+                runs=int(args.runs),
+                sample_size=int(args.sample_size),
+                seed=int(args.seed),
+                compute_cost=bool(args.compute_cost),
+                stratum_label=stratum_label,
+            )
+        }
+        mode = "factor_view"
+
+    out_obj: Dict[str, Any] = {
         "config": {
             "index": args.index,
             "src_dir": args.src_dir,
             "gen_root": args.gen_root,
             "models": list(args.models),
             "filters": {
-                "visual_type": args.visual_type,
-                "sentiment_polarity": args.sentiment_polarity,
-                "layout_type": args.layout_type,
+                "visual_type": visual_type,
+                "sentiment_polarity": sentiment_polarity,
+                "layout_type": layout_type,
             },
             "sampling": {
-                "runs": args.runs,
-                "sample_size": args.sample_size,
-                "seed": args.seed,
+                "runs": int(args.runs),
+                "sample_size": int(args.sample_size),
+                "seed": int(args.seed),
             },
             "judge": {
-                "judge_model": args.model,
-                "rationale_first": rationale_first,
-                "images_first": images_first,
-                "temperature": args.temperature,
-                "max_output_tokens": args.max_output_tokens,
+                "judge_model": args.judge_model,
+                "rationale_first": bool(rationale_first),
+                "images_first": bool(images_first),
+                "temperature": float(args.temperature),
+                "max_output_tokens": int(args.max_output_tokens),
+                "compute_cost": bool(args.compute_cost),
             },
             "cache": {
                 "enabled": bool(args.use_cache),
-                "db": args.db,
+                "db": str(args.db),
                 "force_refresh": bool(args.force_refresh),
             },
-            "compute_cost": bool(args.compute_cost),
-            "modes": {
-                "mode_model_view": mode_model_view,
-                "mode_factor_view": mode_factor_view,
+            "concurrency": {
+                "sample_workers": int(args.sample_workers),
+                "max_in_flight": int(args.max_in_flight),
             },
+            "retry": {
+                "max_retries": int(args.max_retries),
+                "timeout_s": float(args.timeout_s),
+            },
+            "mode": mode,
         },
         "overview_before_filters": overview_before,
         "missing_report": missing_report,
         "overview_after_missing_filter": overview_after,
-        "results": summary,
+        "results": results,
         "notes": {
-            "cost_behavior": "cost is summed ONLY for non-cache calls, using cost_info['estimated_cost_usd'] returned by JudgeClient.judge().",
-            "statistics": "Each metric reports mean/std/CI95 over repeated subsampling runs (replicate means).",
-            "modes": {
-                "model_view": "Per-model aggregation; per-run sample is uniformly allocated over (visual_type,sentiment_polarity,layout_type) combinations.",
-                "factor_view": "Per-factor aggregation (visual_type/sentiment_polarity/layout_type separately); per-run sample budget is evenly split across models within each factor value.",
-            },
+            "factor_view_behavior": "factor_view evaluates ONLY the specified filter-combination stratum (or all if none). Sampling is evenly split across models; metrics are pooled across models and summarized with mean/std/CI over runs.",
+            "cost_behavior": "Cost is summed ONLY for non-cache calls, using cost_info['estimated_cost_usd'] returned by judge.py.",
         },
     }
 
     js = json.dumps(out_obj, ensure_ascii=False, indent=2)
-
     if args.out:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as f:
