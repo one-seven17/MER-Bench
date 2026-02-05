@@ -60,7 +60,7 @@ setup_logging()
 # Constants & helpers
 # =============================
 
-EMOTIONS_8 = ["angry", "sad", "fear", "disgust", "calm", "happy", "excited", "relaxed"]
+EMOTIONS_8 = ["angry", "sad", "tense", "bored", "calm", "happy", "excited", "relaxed"]
 EMOTIONS_9 = EMOTIONS_8 + ["other"]
 
 
@@ -1015,67 +1015,3 @@ class JudgePipeline:
         out.sort(key=lambda x: x["sample"]["sample_id"])
         logger.info("BATCH DONE | n={}", len(out))
         return out
-
-
-# =============================
-# Example main
-# =============================
-
-if __name__ == "__main__":
-    # Example usage:
-    #
-    # LOG_LEVEL=DEBUG python judge.py
-    #
-    # Enable cost estimation:
-    #   export OPENAI_PRICE_TABLE_JSON='{"gpt-5.2":{"input":1.75,"cached_input":0.18,"output":14.0}}'
-    #   python judge.py
-    #
-    # OR:
-    #   export OPENAI_PRICE_INPUT_PER_1M=1.75
-    #   export OPENAI_PRICE_CACHED_INPUT_PER_1M=0.18
-    #   export OPENAI_PRICE_OUTPUT_PER_1M=14.0
-    #   python judge.py
-
-    sample = MemeSample(
-        sample_id="21.png",
-        src_image_path="datasets/Original/21.png",
-        gen_image_path="Generated/FLUX.2-klein-4B/21.png",
-        src_emotion="angry",
-        tgt_emotion="calm",
-        src_caption_text="Me when the customer puts their money on the\ncounter instead of my outstretched hand\nMemeCenter.com\n",
-        tgt_caption_text="Me when the customer smiles and thanks me while paying — what a great start to the day!",
-        edit_instruction="Transform the expression into calm/content, warmer softer lighting, preserve layout and subject.",
-    )
-
-    client = JudgeClient(
-        model="gpt-5.2",
-        retry=RetryConfig(
-            max_retries=6,
-            base_delay_s=0.6,
-            max_delay_s=20.0,
-            jitter=0.25,
-            timeout_s=120,
-        ),
-        max_in_flight=8,
-        cache=CacheConfig(
-            enabled=True, db_path="judge_cache.sqlite3", return_cached_errors=False
-        ),
-    )
-
-    cfg = JudgeConfig(
-        rationale_first=True,
-        images_first=True,
-        temperature=0.0,
-        max_output_tokens=900,
-        cost=CostConfig(enabled=True),  # <---- 开关：是否输出 cost 字段
-    )
-
-    pipeline = JudgePipeline(
-        client=client,
-        cfg=cfg,
-        ccfg=ConcurrencyConfig(sample_workers=2),
-        rcfg=RunConfig(use_cache=True, force_refresh=True),
-    )
-
-    result = pipeline.evaluate_sample(sample)
-    print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -227,5 +227,4 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Dataset
-datasets
-Generated
+data

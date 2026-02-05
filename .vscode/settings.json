@@ -1,0 +1,11 @@
+{
+    "workbench.colorCustomizations": {
+        "minimap.background": "#11111100",
+        "scrollbar.shadow": "#11111100"
+    },
+    "python.testing.pytestArgs": [
+        "tests"
+    ],
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": true
+}

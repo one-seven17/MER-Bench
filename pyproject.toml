@@ -1,0 +1,14 @@
+[project]
+name = "meme-reframing-bench"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "huggingface-hub[cli]>=1.4.0",
+    "loguru>=0.7.3",
+    "openai>=2.16.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
