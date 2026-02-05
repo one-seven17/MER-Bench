@@ -705,8 +705,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--sample-workers",
         type=int,
-        default=64,
-        help="Pipeline sample-level worker threads (default 64).",
+        default=16,
+        help="Pipeline sample-level worker threads (default 16).",
     )
     p.add_argument(
         "--max-in-flight",
