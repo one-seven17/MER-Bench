@@ -1,16 +1,52 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+main.py
+
+Batch evaluator for meme emotion reframing:
+- Load index (json or jsonl).
+- Verify missing generations per model and filter out.
+- Filter by visual_type/sentiment_polarity/layout_type.
+- Two evaluation modes (can enable both):
+    (1) model_view: per-model metrics with uniform sampling over (visual_type,sentiment_polarity,layout_type) combinations.
+    (2) factor_view: per-factor (visual_type / sentiment_polarity / layout_type) metrics;
+                    within each factor value, per-run sample budget is evenly split across models.
+- Output per-model metric performance + (optional) cost summary (exclude cache hits).
+
+IMPORTANT:
+- This script expects your judge.py's JudgeClient.judge(...) returns (payload, cost_info).
+  payload: dict (strict JSON result)
+  cost_info: dict like:
+    {
+      "model": ...,
+      "pricing_usd_per_1m_tokens": {...} or ...,
+      "usage_tokens": {
+        "input_tokens": ...,
+        "cached_input_tokens": ...,
+        "output_tokens": ...,
+        "reasoning_tokens": ...,
+      },
+      "estimated_cost_usd": ...,
+      "latency_ms": ...,
+    }
+- Cache hits are counted by presence of payload["_cache_key"] and payload["_cached_is_error"] and no payload["error"].
+  Cost is summed ONLY when NOT cache hit.
+"""
+
 from __future__ import annotations
 
 import argparse
-import itertools
 import json
 import os
 import random
 import sys
+from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from loguru import logger
 
 # ---- import your judge module ----
+# expects judge.py exposes these symbols
 try:
     from judge import (
         CacheConfig,
@@ -44,18 +80,24 @@ def load_index(path: str) -> List[Dict[str, Any]]:
     with open(path, "r", encoding="utf-8") as f:
         raw = f.read().strip()
 
+    # Heuristic: if starts with "[" treat as JSON array
     if raw.startswith("["):
-        data = json.loads(raw)
-        if not isinstance(data, list):
-            raise ValueError("JSON root is not a list")
-        return data
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, list):
+                raise ValueError("JSON root is not a list")
+            return data
+        except Exception as e:
+            raise ValueError(f"Failed to parse JSON array: {e}")
 
+    # Otherwise JSONL
     rows: List[Dict[str, Any]] = []
     with open(path, "r", encoding="utf-8") as f2:
         for ln, line in enumerate(f2, start=1):
             s = line.strip()
             if not s:
                 continue
+            # tolerate trailing commas like: {...},
             if s.endswith(","):
                 s = s[:-1].rstrip()
             try:
@@ -70,40 +112,73 @@ def load_index(path: str) -> List[Dict[str, Any]]:
 
 
 # =============================
-# Basic helpers
+# Filtering / grouping helpers
 # =============================
 
 
-def safe_get(d: Dict[str, Any], *path: str) -> Any:
-    cur: Any = d
-    for p in path:
-        if not isinstance(cur, dict):
-            return None
-        cur = cur.get(p)
-    return cur
+def key3(row: Dict[str, Any]) -> Tuple[str, str, str]:
+    return (
+        str(row.get("visual_type", "")),
+        str(row.get("sentiment_polarity", "")),
+        str(row.get("layout_type", "")),
+    )
 
 
-def mean(xs: Sequence[float]) -> float:
-    return sum(xs) / len(xs) if xs else 0.0
+def match_optional(value: str, allowed: Optional[Sequence[str]]) -> bool:
+    if not allowed:
+        return True
+    return value in set(allowed)
 
 
-def std(xs: Sequence[float]) -> float:
-    if len(xs) <= 1:
-        return 0.0
-    m = mean(xs)
-    return (sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5
+def filter_rows(
+    rows: Sequence[Dict[str, Any]],
+    visual_type: Optional[Sequence[str]],
+    sentiment_polarity: Optional[Sequence[str]],
+    layout_type: Optional[Sequence[str]],
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        vt = str(r.get("visual_type", ""))
+        sp = str(r.get("sentiment_polarity", ""))
+        lt = str(r.get("layout_type", ""))
+        if (
+            match_optional(vt, visual_type)
+            and match_optional(sp, sentiment_polarity)
+            and match_optional(lt, layout_type)
+        ):
+            out.append(r)
+    return out
 
 
-def ci95_of_replicates(xs: Sequence[float]) -> Tuple[float, float]:
+def aggregate_counts(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Simple percentile CI across replicate means.
+    Aggregates by visual_type/sentiment_polarity/layout_type.
     """
-    if not xs:
-        return 0.0, 0.0
-    ys = sorted(xs)
-    lo = ys[int(0.025 * (len(ys) - 1))]
-    hi = ys[int(0.975 * (len(ys) - 1))]
-    return lo, hi
+    agg: Dict[Tuple[str, str, str], int] = {}
+    for r in rows:
+        k = key3(r)
+        agg[k] = agg.get(k, 0) + 1
+    # convert keys to json-friendly
+    return {
+        "by_visual_type_sentiment_layout": [
+            {
+                "visual_type": k[0],
+                "sentiment_polarity": k[1],
+                "layout_type": k[2],
+                "count": v,
+            }
+            for k, v in sorted(agg.items(), key=lambda x: (-x[1], x[0]))
+        ]
+    }
+
+
+def group_rows_by_key3(
+    rows: Sequence[Dict[str, Any]],
+) -> Dict[Tuple[str, str, str], List[Dict[str, Any]]]:
+    g: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
+    for r in rows:
+        g.setdefault(key3(r), []).append(r)
+    return g
 
 
 def allocate_quota(total: int, n_buckets: int, rng: random.Random) -> List[int]:
@@ -124,172 +199,28 @@ def allocate_quota(total: int, n_buckets: int, rng: random.Random) -> List[int]:
     return q
 
 
-# =============================
-# Filtering / validation
-# =============================
-
-
-FACTORS = ("visual_type", "sentiment_polarity", "layout_type")
-
-
-def unique_values(rows: Sequence[Dict[str, Any]], field: str) -> List[str]:
-    s = {str(r.get(field, "")) for r in rows if str(r.get(field, ""))}
-    return sorted(s)
-
-
-def validate_closed_set(
-    field: str, requested: Optional[Sequence[str]], allowed: Sequence[str]
-) -> None:
-    if not requested:
-        return
-    allowed_set = set(allowed)
-    bad = [v for v in requested if v not in allowed_set]
-    if bad:
-        raise ValueError(
-            f"Invalid {field} values: {bad}. Allowed (closed set from data): {allowed}"
-        )
-
-
-def row_matches_field(
-    row: Dict[str, Any], field: str, allowed: Optional[Sequence[str]]
-) -> bool:
-    if not allowed:
-        return True
-    return str(row.get(field, "")) in set(allowed)
-
-
-def filter_rows_by_all(
-    rows: Sequence[Dict[str, Any]],
-    visual_type: Optional[Sequence[str]],
-    sentiment_polarity: Optional[Sequence[str]],
-    layout_type: Optional[Sequence[str]],
-) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for r in rows:
-        if (
-            row_matches_field(r, "visual_type", visual_type)
-            and row_matches_field(r, "sentiment_polarity", sentiment_polarity)
-            and row_matches_field(r, "layout_type", layout_type)
-        ):
-            out.append(r)
-    return out
-
-
-def aggregate_counts(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Aggregates by each factor independently (not coupled).
-    """
-    out: Dict[str, Any] = {}
-    for f in FACTORS:
-        cnt: Dict[str, int] = {}
-        for r in rows:
-            v = str(r.get(f, ""))
-            cnt[v] = cnt.get(v, 0) + 1
-        out[f"by_{f}"] = [
-            {"value": k, "count": v}
-            for k, v in sorted(cnt.items(), key=lambda x: (-x[1], x[0]))
-        ]
-    return out
-
-
-# =============================
-# Cartesian "data category cells"
-# =============================
-
-
-def active_factor_spec(
-    visual_type: Optional[Sequence[str]],
-    sentiment_polarity: Optional[Sequence[str]],
-    layout_type: Optional[Sequence[str]],
-) -> List[Tuple[str, List[str]]]:
-    """
-    Return list of (factor_name, factor_values) for factors explicitly specified by user.
-    """
-    spec: List[Tuple[str, List[str]]] = []
-    if visual_type:
-        spec.append(("visual_type", list(visual_type)))
-    if sentiment_polarity:
-        spec.append(("sentiment_polarity", list(sentiment_polarity)))
-    if layout_type:
-        spec.append(("layout_type", list(layout_type)))
-    return spec
-
-
-def build_cells(spec: List[Tuple[str, List[str]]]) -> List[Dict[str, str]]:
-    """
-    Cartesian product of specified factor values.
-    Each cell is a dict: {factor: value, ...}
-    If spec is empty -> single empty cell meaning "no cell constraints".
-    """
-    if not spec:
-        return [{}]
-
-    names = [k for k, _ in spec]
-    value_lists = [vs for _, vs in spec]
-    cells: List[Dict[str, str]] = []
-    for combo in itertools.product(*value_lists):
-        cells.append({names[i]: combo[i] for i in range(len(names))})
-    return cells
-
-
-def cell_key(cell: Dict[str, str]) -> str:
-    if not cell:
-        return "ALL"
-    parts = [f"{k}={cell[k]}" for k in sorted(cell.keys())]
-    return "|".join(parts)
-
-
-def filter_rows_by_cell(
-    rows: Sequence[Dict[str, Any]], cell: Dict[str, str]
+def sample_uniform_over_groups(
+    rows: Sequence[Dict[str, Any]], sample_size: int, rng: random.Random
 ) -> List[Dict[str, Any]]:
     """
-    Only constrain fields present in cell; other factors remain free.
-    """
-    if not cell:
-        return list(rows)
-    out: List[Dict[str, Any]] = []
-    for r in rows:
-        ok = True
-        for k, v in cell.items():
-            if str(r.get(k, "")) != v:
-                ok = False
-                break
-        if ok:
-            out.append(r)
-    return out
-
-
-def sample_uniform_over_cells(
-    rows: Sequence[Dict[str, Any]],
-    cells: Sequence[Dict[str, str]],
-    sample_size: int,
-    rng: random.Random,
-) -> List[Dict[str, Any]]:
-    """
-    Uniform sampling over *cells* (Cartesian product of specified factors).
-    - Allocate sample_size evenly across NON-EMPTY cells (cells with at least 1 row).
-    - Within each cell, sample without replacement if enough; else with replacement.
+    Uniform sampling over key3 groups (visual_type, sentiment_polarity, layout_type).
+    - Allocate sample_size evenly across groups.
+    - Within each group, sample without replacement if enough; else sample with replacement.
     """
     if sample_size <= 0:
         return []
-    if not cells:
+    groups = group_rows_by_key3(rows)
+    if not groups:
         return []
 
-    cell_rows: List[Tuple[Dict[str, str], List[Dict[str, Any]]]] = []
-    for c in cells:
-        cr = filter_rows_by_cell(rows, c)
-        if cr:
-            cell_rows.append((c, cr))
-
-    if not cell_rows:
-        return []
-
-    quotas = allocate_quota(sample_size, len(cell_rows), rng)
+    keys = list(groups.keys())
+    quotas = allocate_quota(sample_size, len(keys), rng)
     out: List[Dict[str, Any]] = []
 
-    for (c, bucket), q in zip(cell_rows, quotas):
+    for k, q in zip(keys, quotas):
         if q <= 0:
             continue
+        bucket = groups[k]
         if len(bucket) >= q:
             out.extend(rng.sample(bucket, k=q))
         else:
@@ -300,15 +231,17 @@ def sample_uniform_over_cells(
 
 
 # =============================
-# Paths + missing checks
+# Path + missing checks
 # =============================
 
 
 def build_src_path(src_dir: str, row: Dict[str, Any]) -> str:
+    # index field: id
     return os.path.join(src_dir, str(row["id"]))
 
 
 def build_gen_path(gen_root: str, model: str, row: Dict[str, Any]) -> str:
+    # index field: gen_id
     return os.path.join(gen_root, model, str(row["gen_id"]))
 
 
@@ -318,6 +251,12 @@ def verify_missing(
     gen_root: str,
     models: Sequence[str],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Returns (kept_rows, report)
+    - A row is kept only if:
+        - SOURCE exists
+        - for each requested model, GENERATED exists
+    """
     kept: List[Dict[str, Any]] = []
     missing_report: Dict[str, Any] = {
         "missing_source": 0,
@@ -356,7 +295,7 @@ def verify_missing(
 
 
 # =============================
-# Metric extraction
+# Metric extraction / scoring
 # =============================
 
 
@@ -372,7 +311,29 @@ METRIC_KEYS = [
 ]
 
 
+def safe_get(d: Dict[str, Any], *path: str) -> Any:
+    cur: Any = d
+    for p in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(p)
+    return cur
+
+
 def extract_metrics(payload: Dict[str, Any], tgt_emotion: str) -> Dict[str, float]:
+    """
+    Normalize to numeric scores where applicable.
+
+    Assumes judge schema:
+      - visual_assessment.generation_quality_1_5
+      - visual_assessment.emotion_accuracy_1_5
+      - text_assessment.generation_quality_1_5
+      - text_assessment.emotion_accuracy_1_5
+      - layout_consistency.consistent
+      - overall_emotion_classification.label (+ other_emotion)
+      - perceived_emotion_shift.magnitude_1_5
+      - overall_generation_quality.overall_generation_quality_1_5
+    """
     out: Dict[str, float] = {}
 
     vq = safe_get(payload, "visual_assessment", "generation_quality_1_5")
@@ -386,19 +347,25 @@ def extract_metrics(payload: Dict[str, Any], tgt_emotion: str) -> Dict[str, floa
         payload, "overall_generation_quality", "overall_generation_quality_1_5"
     )
 
-    def to_1_5(x: Any) -> float:
-        if isinstance(x, (int, float)) and 1 <= float(x) <= 5:
-            return float(x)
-        return 0.0
+    def to_1_5(x: Any) -> Optional[float]:
+        if isinstance(x, (int, float)):
+            if 1 <= float(x) <= 5:
+                return float(x)
+        return None
 
-    out["visual_generation_quality_1_5"] = to_1_5(vq)
-    out["visual_emotion_accuracy_1_5"] = to_1_5(va)
-    out["text_generation_quality_1_5"] = to_1_5(tq)
-    out["text_emotion_accuracy_1_5"] = to_1_5(ta)
-    out["perceived_emotion_shift_1_5"] = to_1_5(shift)
-    out["overall_generation_quality_1_5"] = to_1_5(oq)
+    out["visual_generation_quality_1_5"] = to_1_5(vq) or 0.0
+    out["visual_emotion_accuracy_1_5"] = to_1_5(va) or 0.0
+    out["text_generation_quality_1_5"] = to_1_5(tq) or 0.0
+    out["text_emotion_accuracy_1_5"] = to_1_5(ta) or 0.0
+    out["perceived_emotion_shift_1_5"] = to_1_5(shift) or 0.0
+    out["overall_generation_quality_1_5"] = to_1_5(oq) or 0.0
 
-    out["layout_consistency_accuracy"] = 1.0 if isinstance(lc, bool) and lc else 0.0
+    if isinstance(lc, bool):
+        out["layout_consistency_accuracy"] = 1.0 if lc else 0.0
+    else:
+        out["layout_consistency_accuracy"] = 0.0
+
+    # classification hit wrt tgt_emotion (target-gated)
     out["tgt_emotion_hit"] = (
         1.0 if (isinstance(cls_label, str) and cls_label == tgt_emotion) else 0.0
     )
@@ -412,6 +379,11 @@ def extract_metrics(payload: Dict[str, Any], tgt_emotion: str) -> Dict[str, floa
 
 
 def cache_flag(payload: Dict[str, Any]) -> bool:
+    """
+    Your SQLiteStore marks:
+      payload["_cache_key"], payload["_cached_is_error"]
+    We treat it as cache-hit if those keys exist AND there's no "error" in payload.
+    """
     if "error" in payload:
         return False
     return ("_cache_key" in payload) and ("_cached_is_error" in payload)
@@ -442,6 +414,29 @@ def make_sample(
         tgt_caption_text=row.get("pos_txt"),
         edit_instruction=row.get("spec"),
     )
+
+
+def mean(xs: Sequence[float]) -> float:
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def std(xs: Sequence[float]) -> float:
+    if len(xs) <= 1:
+        return 0.0
+    m = mean(xs)
+    return (sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5
+
+
+def ci95_of_replicates(xs: Sequence[float]) -> Tuple[float, float]:
+    """
+    Simple percentile CI across replicate means.
+    """
+    if not xs:
+        return 0.0, 0.0
+    ys = sorted(xs)
+    lo = ys[int(0.025 * (len(ys) - 1))]
+    hi = ys[int(0.975 * (len(ys) - 1))]
+    return lo, hi
 
 
 def _init_rep_struct(models: Sequence[str]) -> Dict[str, Dict[str, List[float]]]:
@@ -509,10 +504,8 @@ def evaluate_models(
     compute_cost: bool,
     use_cache: bool,
     force_refresh: bool,
-    # NEW:
-    cells: Sequence[Dict[str, str]],
     mode_model_view: bool,
-    mode_category_view: bool,
+    mode_factor_view: bool,
 ) -> Dict[str, Any]:
     rng = random.Random(seed)
 
@@ -525,16 +518,15 @@ def evaluate_models(
 
     # -------------------------
     # Mode 1: model_view
-    # Per model, uniform sampling over CELLS
     # -------------------------
     if mode_model_view:
-        rep_means = _init_rep_struct(models)
-        book = _init_book_struct(models)
+        model_view_rep_means = _init_rep_struct(models)
+        model_view_book = _init_book_struct(models)
 
         for r_i in range(runs):
-            batch = sample_uniform_over_cells(
-                rows, cells=cells, sample_size=sample_size, rng=rng
-            )
+            # uniform over key3 combinations (visual_type, sentiment_polarity, layout_type)
+            batch = sample_uniform_over_groups(rows, sample_size=sample_size, rng=rng)
+
             rep_vals = _init_rep_struct(models)
 
             for row in batch:
@@ -549,7 +541,9 @@ def evaluate_models(
                         force_refresh=force_refresh,
                     )
 
-                    _update_bookkeeping(book, m, payload, cost_info, compute_cost)
+                    _update_bookkeeping(
+                        model_view_book, m, payload, cost_info, compute_cost
+                    )
                     if "error" in payload:
                         continue
 
@@ -559,97 +553,115 @@ def evaluate_models(
 
             for m in models:
                 for k in METRIC_KEYS:
-                    rep_means[m][k].append(mean(rep_vals[m][k]))
+                    model_view_rep_means[m][k].append(mean(rep_vals[m][k]))
 
             logger.info("[model_view] Run {}/{} done.", r_i + 1, runs)
 
-        out["model_view"] = _summarize_rep_means(rep_means, runs=runs)
-        out["model_view"]["bookkeeping"] = book
+        out["model_view"] = _summarize_rep_means(model_view_rep_means, runs=runs)
+        out["model_view"]["bookkeeping"] = model_view_book
 
     # -------------------------
-    # Mode 2: category_view
-    # For each cell, results aggregated across models.
-    # Requirement:
-    #   - output has |cells| keys (e.g., 4 keys)
-    #   - each val is aggregated over specified models
-    #   - within each cell per run, sample_size budget is evenly split across models
+    # Mode 2: factor_view
     # -------------------------
-    if mode_category_view:
-        cat_out: Dict[str, Any] = {}
+    if mode_factor_view:
 
-        for cell in cells:
-            ck = cell_key(cell)
-            cell_rows = filter_rows_by_cell(rows, cell)
-            if not cell_rows:
-                cat_out[ck] = {
-                    "warning": "empty_cell_after_filters",
-                    "cell": cell,
-                }
-                continue
+        def factor_groups(
+            rows_: Sequence[Dict[str, Any]], factor: str
+        ) -> Dict[str, List[Dict[str, Any]]]:
+            g: Dict[str, List[Dict[str, Any]]] = {}
+            for rr in rows_:
+                v = str(rr.get(factor, ""))
+                g.setdefault(v, []).append(rr)
+            return g
 
-            rep_means = _init_rep_struct(models)
-            book = _init_book_struct(models)
+        vt_groups = factor_groups(rows, "visual_type")
+        sp_groups = factor_groups(rows, "sentiment_polarity")
+        lt_groups = factor_groups(rows, "layout_type")
 
-            for r_i in range(runs):
-                # split per-run budget across models
-                mquotas = allocate_quota(sample_size, len(models), rng)
-                mquota_map = {m: q for m, q in zip(models, mquotas)}
-                rep_vals = _init_rep_struct(models)
+        factor_view: Dict[str, Any] = {
+            "visual_type": {},
+            "sentiment_polarity": {},
+            "layout_type": {},
+        }
 
-                for m in models:
-                    q = mquota_map[m]
-                    if q <= 0:
-                        continue
+        def eval_one_factor_set(
+            groups: Dict[str, List[Dict[str, Any]]], factor_name: str
+        ) -> Dict[str, Any]:
+            result: Dict[str, Any] = {}
 
-                    if len(cell_rows) >= q:
-                        gbatch = rng.sample(cell_rows, k=q)
-                    else:
-                        gbatch = [rng.choice(cell_rows) for _ in range(q)]
+            for fv, grows in groups.items():
+                rep_means = _init_rep_struct(models)
+                book = _init_book_struct(models)
 
-                    for row in gbatch:
-                        tgt = str(row.get("tgt_emo", ""))
+                for r_i in range(runs):
+                    # per-run sample_size budget split evenly across models
+                    mquotas = allocate_quota(sample_size, len(models), rng)
+                    mquota_map = {m: q for m, q in zip(models, mquotas)}
 
-                        sample = make_sample(src_dir, gen_root, m, row)
-                        payload, cost_info = client.judge(
-                            sample,
-                            cfg,
-                            use_cache=use_cache,
-                            force_refresh=force_refresh,
-                        )
+                    rep_vals = _init_rep_struct(models)
 
-                        _update_bookkeeping(book, m, payload, cost_info, compute_cost)
-                        if "error" in payload:
+                    for m in models:
+                        q = mquota_map[m]
+                        if q <= 0:
                             continue
 
-                        metrics = extract_metrics(payload, tgt)
-                        for kk, vv in metrics.items():
-                            rep_vals[m][kk].append(float(vv))
+                        if len(grows) >= q:
+                            gbatch = rng.sample(grows, k=q)
+                        else:
+                            gbatch = [rng.choice(grows) for _ in range(q)]
 
-                for m in models:
-                    for kk in METRIC_KEYS:
-                        rep_means[m][kk].append(mean(rep_vals[m][kk]))
+                        for row in gbatch:
+                            tgt = str(row.get("tgt_emo", ""))
 
-            summarized = _summarize_rep_means(rep_means, runs=runs)
-            summarized["bookkeeping"] = book
+                            sample = make_sample(src_dir, gen_root, m, row)
+                            payload, cost_info = client.judge(
+                                sample,
+                                cfg,
+                                use_cache=use_cache,
+                                force_refresh=force_refresh,
+                            )
 
-            # aggregate across models (macro)
-            macro: Dict[str, Any] = {}
-            for kk in METRIC_KEYS:
-                model_means = [
-                    summarized["models"][m][kk]["mean_over_runs"] for m in models
-                ]
-                macro[kk] = {
-                    "mean_over_models": mean(model_means),
-                    "models": len(models),
-                }
-            summarized["macro_over_models"] = macro
-            summarized["cell"] = cell
-            summarized["cell_size"] = len(cell_rows)
+                            _update_bookkeeping(
+                                book, m, payload, cost_info, compute_cost
+                            )
+                            if "error" in payload:
+                                continue
 
-            cat_out[ck] = summarized
-            logger.info("[category_view] cell {} done.", ck)
+                            metrics = extract_metrics(payload, tgt)
+                            for kk, vv in metrics.items():
+                                rep_vals[m][kk].append(float(vv))
 
-        out["category_view"] = cat_out
+                    for m in models:
+                        for kk in METRIC_KEYS:
+                            rep_means[m][kk].append(mean(rep_vals[m][kk]))
+
+                summarized = _summarize_rep_means(rep_means, runs=runs)
+                summarized["bookkeeping"] = book
+
+                # macro-average across models for quick comparison
+                macro: Dict[str, Any] = {}
+                for kk in METRIC_KEYS:
+                    model_means = [
+                        summarized["models"][m][kk]["mean_over_runs"] for m in models
+                    ]
+                    macro[kk] = {
+                        "mean_over_models": mean(model_means),
+                        "models": len(models),
+                    }
+                summarized["macro_over_models"] = macro
+
+                result[fv] = summarized
+                logger.info("[factor_view:{}={}] done.", factor_name, fv)
+
+            return result
+
+        factor_view["visual_type"] = eval_one_factor_set(vt_groups, "visual_type")
+        factor_view["sentiment_polarity"] = eval_one_factor_set(
+            sp_groups, "sentiment_polarity"
+        )
+        factor_view["layout_type"] = eval_one_factor_set(lt_groups, "layout_type")
+
+        out["factor_view"] = factor_view
 
     return out
 
@@ -756,16 +768,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Include cost summary (exclude cache hits).",
     )
 
-    # Modes (can enable both)
+    # === MOD: modes (can enable both) ===
     p.add_argument(
         "--mode-model-view",
         action="store_true",
-        help="Per-model metrics with uniform sampling over Cartesian cells of specified factors.",
+        help="Mode 1: per-model metrics with uniform sampling over (visual_type,sentiment_polarity,layout_type) combinations.",
     )
     p.add_argument(
-        "--mode-category-view",
+        "--mode-factor-view",
         action="store_true",
-        help="Per-cell metrics aggregated across models; sample budget evenly split across models per cell.",
+        help="Mode 2: per-factor (visual_type / sentiment_polarity / layout_type) metrics; within each factor value, sample budget is evenly split across models.",
     )
 
     p.add_argument(
@@ -797,34 +809,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.images_last:
         images_first = False
 
-    # modes
+    # === MOD: mode defaults ===
     mode_model_view = bool(args.mode_model_view)
-    mode_category_view = bool(args.mode_category_view)
-    if not mode_model_view and not mode_category_view:
+    mode_factor_view = bool(args.mode_factor_view)
+    if not mode_model_view and not mode_factor_view:
         mode_model_view = True  # default
 
     # load index
     rows_all = load_index(args.index)
     logger.info("Loaded index rows: {}", len(rows_all))
 
-    # ====== NEW: closed-set validation (from the data itself) ======
-    allowed_vt = unique_values(rows_all, "visual_type")
-    allowed_sp = unique_values(rows_all, "sentiment_polarity")
-    allowed_lt = unique_values(rows_all, "layout_type")
-
-    try:
-        validate_closed_set("visual_type", args.visual_type, allowed_vt)
-        validate_closed_set("sentiment_polarity", args.sentiment_polarity, allowed_sp)
-        validate_closed_set("layout_type", args.layout_type, allowed_lt)
-    except Exception as e:
-        logger.error("Filter validation failed: {}", e)
-        return 2
-
     # aggregate overview BEFORE missing filter
     overview_before = aggregate_counts(rows_all)
 
-    # filter by fields (still an AND filter, but NOTE: cells are built later only from specified factors)
-    rows_filtered = filter_rows_by_all(
+    # filter by fields (before missing check)
+    rows_filtered = filter_rows(
         rows_all,
         visual_type=args.visual_type,
         sentiment_polarity=args.sentiment_polarity,
@@ -844,22 +843,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # aggregate overview AFTER missing filter
     overview_after = aggregate_counts(rows_kept)
-
-    # ====== NEW: build CARTESIAN CELLS only from specified factors (decoupled) ======
-    spec = active_factor_spec(
-        args.visual_type, args.sentiment_polarity, args.layout_type
-    )
-    cells = build_cells(spec)
-    logger.info("Active factors: {}", [k for k, _ in spec] if spec else ["(none)"])
-    logger.info("Cartesian cell count: {}", len(cells))
-
-    # If user specified factors but some cells are empty after missing filter, warn early
-    empty_cells = [cell_key(c) for c in cells if not filter_rows_by_cell(rows_kept, c)]
-    if empty_cells:
-        logger.warning(
-            "Empty cells after filters+missing-check (will be skipped in uniform sampling): {}",
-            empty_cells[:50],
-        )
 
     # build judge client
     client = JudgeClient(
@@ -894,9 +877,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         compute_cost=bool(args.compute_cost),
         use_cache=bool(args.use_cache),
         force_refresh=bool(args.force_refresh),
-        cells=cells,
         mode_model_view=mode_model_view,
-        mode_category_view=mode_category_view,
+        mode_factor_view=mode_factor_view,
     )
 
     out_obj = {
@@ -914,9 +896,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "runs": args.runs,
                 "sample_size": args.sample_size,
                 "seed": args.seed,
-                "cells": [cell_key(c) for c in cells],
-                "active_factors_for_cells": [k for k, _ in spec] if spec else [],
-                "note": "Cells are built from the Cartesian product of explicitly specified factors only.",
             },
             "judge": {
                 "judge_model": args.model,
@@ -933,23 +912,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "compute_cost": bool(args.compute_cost),
             "modes": {
                 "mode_model_view": mode_model_view,
-                "mode_category_view": mode_category_view,
+                "mode_factor_view": mode_factor_view,
             },
-        },
-        "closed_sets": {
-            "visual_type": allowed_vt,
-            "sentiment_polarity": allowed_sp,
-            "layout_type": allowed_lt,
         },
         "overview_before_filters": overview_before,
         "missing_report": missing_report,
         "overview_after_missing_filter": overview_after,
         "results": summary,
         "notes": {
-            "cost_behavior": "Cost is summed ONLY for non-cache calls, using cost_info['estimated_cost_usd'] returned by JudgeClient.judge().",
+            "cost_behavior": "cost is summed ONLY for non-cache calls, using cost_info['estimated_cost_usd'] returned by JudgeClient.judge().",
+            "statistics": "Each metric reports mean/std/CI95 over repeated subsampling runs (replicate means).",
             "modes": {
-                "model_view": "Per-model aggregation; per-run sample is uniformly allocated over Cartesian cells of specified factors.",
-                "category_view": "Per-cell aggregation; within each cell and run, sample budget is evenly split across models; output has |cells| keys.",
+                "model_view": "Per-model aggregation; per-run sample is uniformly allocated over (visual_type,sentiment_polarity,layout_type) combinations.",
+                "factor_view": "Per-factor aggregation (visual_type/sentiment_polarity/layout_type separately); per-run sample budget is evenly split across models within each factor value.",
             },
         },
     }
