@@ -5,24 +5,30 @@ main.py
 
 High-concurrency batch evaluator for meme emotion reframing.
 
-Behaviors (latest):
+Behaviors:
 1) Uses judge.py concurrency + retry:
    - JudgeClient: retry + in-flight semaphore
    - JudgePipeline: ThreadPoolExecutor concurrency
 2) factor_view and model_view are mutually exclusive.
 3) visual_type / sentiment_polarity / layout_type: each can be specified with at most ONE value, or omitted.
-4) model_view: no longer needs category-uniform sampling (filters are single-or-none).
-5) factor_view: ONLY evaluates the specified filter-combination stratum (or all if no filters).
+4) model_view: evaluates all selected stratum rows; per run samples rows then evaluates ALL models.
+5) factor_view: evaluates ONLY the specified filter-combination stratum (or all if no filters).
    - Sampling is evenly split across models each run.
    - Aggregation is from stratum perspective (models marginalized), report mean/std/CI over runs.
 6) Supports configurable concurrency: --sample-workers and --max-in-flight.
 7) Optional cost accumulation excludes cache hits.
-
-NEW:
 8) --dry-run: only stats + sampling plan, no judge calls.
 9) Save per-run jsonl outputs by model under:
-     save_dir/{model_view|factor_view}/{model}/{run_idx}.jsonl
+     output_save_dir/{exp}/{model_view|factor_view}/{model}/{run_idx}.jsonl
    Each line records sampled row_id/gen_id and the out item from pipeline.
+10) Save final summary JSON under:
+     out_dir/{model_view|factor_view}/{filename}.json
+   where filename encodes models + factor filters + sampling.
+
+Notes:
+- This script assumes you place it next to judge.py and judge.py exports:
+  CacheConfig, ConcurrencyConfig, JudgeClient, JudgeConfig, JudgePipeline, MemeSample,
+  RetryConfig, RunConfig
 """
 
 from __future__ import annotations
@@ -261,7 +267,6 @@ def extract_metrics(payload: Dict[str, Any], tgt_emotion: str) -> Dict[str, floa
     out["tgt_emotion_hit"] = (
         1.0 if (isinstance(cls_label, str) and cls_label == tgt_emotion) else 0.0
     )
-
     return out
 
 
@@ -305,9 +310,7 @@ def allocate_quota(total: int, n_buckets: int, rng: random.Random) -> List[int]:
 def sample_rows(
     rows: Sequence[Dict[str, Any]], k: int, rng: random.Random
 ) -> List[Dict[str, Any]]:
-    if k <= 0:
-        return []
-    if not rows:
+    if k <= 0 or not rows:
         return []
     if len(rows) >= k:
         return rng.sample(list(rows), k=k)
@@ -323,11 +326,67 @@ def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+def write_json(path: str, obj: Dict[str, Any]) -> None:
+    _ensure_dir(os.path.dirname(path) or ".")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False, indent=2))
+
+
 def write_jsonl(path: str, records: Sequence[Dict[str, Any]]) -> None:
     _ensure_dir(os.path.dirname(path) or ".")
     with open(path, "w", encoding="utf-8") as f:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def _safe_slug(s: str) -> str:
+    # Keep filenames portable.
+    return "".join(c if (c.isalnum() or c in "._-+=") else "_" for c in s)
+
+
+def build_experiment_dirname(
+    *,
+    models: Sequence[str],
+    visual_type: Optional[str],
+    sentiment_polarity: Optional[str],
+    layout_type: Optional[str],
+) -> str:
+    parts: List[str] = []
+    parts.append("models=" + "+".join(models))
+    parts.append(f"vt={visual_type or 'all'}")
+    parts.append(f"sp={sentiment_polarity or 'all'}")
+    parts.append(f"lt={layout_type or 'all'}")
+    return _safe_slug("__".join(parts))
+
+
+def build_summary_filename(
+    *,
+    mode: str,
+    models: Sequence[str],
+    visual_type: Optional[str],
+    sentiment_polarity: Optional[str],
+    layout_type: Optional[str],
+    runs: int,
+    sample_size: int,
+) -> str:
+    parts: List[str] = []
+    parts.append("models=" + "+".join(models))
+    parts.append(f"vt={visual_type or 'all'}")
+    parts.append(f"sp={sentiment_polarity or 'all'}")
+    parts.append(f"lt={layout_type or 'all'}")
+    parts.append(f"runs={runs}")
+    parts.append(f"n={sample_size}")
+    return _safe_slug("__".join(parts)) + ".json"
+
+
+def build_run_jsonl_path(
+    *,
+    base_output_dir: str,
+    mode: str,
+    model: str,
+    run_idx: int,
+) -> str:
+    return os.path.join(base_output_dir, mode, model, f"{run_idx}.jsonl")
 
 
 # =============================
@@ -385,7 +444,7 @@ def ci95_of_replicates(xs: Sequence[float]) -> Tuple[float, float]:
 
 
 # =============================
-# Evaluation modes
+# Evaluation bookkeeping
 # =============================
 
 
@@ -394,7 +453,8 @@ def init_book(models: Sequence[str]) -> Dict[str, Any]:
         "per_model": {
             m: {"api_calls": 0, "cache_hits": 0, "cost_usd": 0.0, "errors": 0}
             for m in models
-        }
+        },
+        "overall": {"api_calls": 0, "cache_hits": 0, "cost_usd": 0.0, "errors": 0},
     }
 
 
@@ -405,19 +465,8 @@ def update_book(
     cost_info: Optional[Dict[str, Any]],
     compute_cost: bool,
 ) -> None:
-    if "per_model" not in book:
-        book["per_model"] = {}
-
     if model not in book["per_model"]:
         book["per_model"][model] = {
-            "api_calls": 0,
-            "cache_hits": 0,
-            "cost_usd": 0.0,
-            "errors": 0,
-        }
-
-    if "overall" not in book:
-        book["overall"] = {
             "api_calls": 0,
             "cache_hits": 0,
             "cost_usd": 0.0,
@@ -436,11 +485,15 @@ def update_book(
 
     book["per_model"][model]["api_calls"] += 1
     book["overall"]["api_calls"] += 1
-
     if compute_cost:
         c = extract_cost_usd_from_cost_info(cost_info)
         book["per_model"][model]["cost_usd"] += c
         book["overall"]["cost_usd"] += c
+
+
+# =============================
+# Evaluation modes
+# =============================
 
 
 def evaluate_model_view(
@@ -454,17 +507,17 @@ def evaluate_model_view(
     sample_size: int,
     seed: int,
     compute_cost: bool,
-    save_dir: str,
+    base_output_dir: str,
     save_outputs: bool,
 ) -> Dict[str, Any]:
     rng = random.Random(seed)
 
+    # replicate means per model per metric (length = runs)
     rep_means: Dict[str, Dict[str, List[float]]] = {
         m: {k: [] for k in METRIC_KEYS} for m in models
     }
     book = init_book(models)
 
-    # map for row lookup by id (for saving gen_id, etc.)
     row_by_id: Dict[str, Dict[str, Any]] = {str(r.get("id")): r for r in rows}
 
     for r_i in range(runs):
@@ -483,9 +536,9 @@ def evaluate_model_view(
         run_vals: Dict[str, Dict[str, List[float]]] = {
             m: {k: [] for k in METRIC_KEYS} for m in models
         }
-
-        # saving buffers per model
-        save_buf: Dict[str, List[Dict[str, Any]]] = {m: [] for m in models}
+        save_buf: Dict[str, List[Dict[str, Any]]] = (
+            {m: [] for m in models} if save_outputs else {}
+        )
 
         for item in results:
             sample_obj = item.get("sample", {})
@@ -496,7 +549,6 @@ def evaluate_model_view(
 
             update_book(book, model, payload, cost_info, compute_cost)
 
-            # save (id + out)
             if save_outputs and model in save_buf:
                 row_id = parse_row_id_from_sample_id(sample_id)
                 row = row_by_id.get(row_id, {})
@@ -518,10 +570,14 @@ def evaluate_model_view(
             for kk, vv in metrics.items():
                 run_vals[model][kk].append(float(vv))
 
-        # flush saved jsonl per run per model
         if save_outputs:
             for m in models:
-                path = os.path.join(save_dir, "model_view", m, f"{r_i}.jsonl")
+                path = build_run_jsonl_path(
+                    base_output_dir=base_output_dir,
+                    mode="model_view",
+                    model=m,
+                    run_idx=r_i,
+                )
                 write_jsonl(path, save_buf.get(m, []))
 
         for m in models:
@@ -540,9 +596,9 @@ def evaluate_model_view(
                 "std_over_runs": std(xs),
                 "ci95_over_runs": list(ci95_of_replicates(xs)),
                 "runs": runs,
+                "replicate_means": xs,
             }
         summary["models"][m] = mm
-
     return summary
 
 
@@ -558,12 +614,11 @@ def evaluate_factor_view_stratum(
     seed: int,
     compute_cost: bool,
     stratum_label: Dict[str, Optional[str]],
-    save_dir: str,
+    base_output_dir: str,
     save_outputs: bool,
 ) -> Dict[str, Any]:
     """
-    factor_view (models marginalized), but ONLY for the given stratum:
-      - rows passed in are already filtered to the specified combination (single-or-none).
+    factor_view (models marginalized), only on the specified stratum:
       - Each run: split sample_size evenly across models, sample rows, evaluate, pool metrics across models.
       - Over runs: mean/std/CI of pooled means.
     """
@@ -571,7 +626,6 @@ def evaluate_factor_view_stratum(
 
     rep_means: Dict[str, List[float]] = {k: [] for k in METRIC_KEYS}
     book = init_book(models)
-
     row_by_id: Dict[str, Dict[str, Any]] = {str(r.get("id")): r for r in rows}
 
     for r_i in range(runs):
@@ -590,8 +644,9 @@ def evaluate_factor_view_stratum(
         results = pipeline.evaluate_batch(samples)
 
         pooled_vals: Dict[str, List[float]] = {k: [] for k in METRIC_KEYS}
-
-        save_buf: Dict[str, List[Dict[str, Any]]] = {m: [] for m in models}
+        save_buf: Dict[str, List[Dict[str, Any]]] = (
+            {m: [] for m in models} if save_outputs else {}
+        )
 
         for item in results:
             sample_obj = item.get("sample", {})
@@ -623,10 +678,14 @@ def evaluate_factor_view_stratum(
             for kk, vv in metrics.items():
                 pooled_vals[kk].append(float(vv))
 
-        # flush saved jsonl per run per model
         if save_outputs:
             for m in models:
-                path = os.path.join(save_dir, "factor_view", m, f"{r_i}.jsonl")
+                path = build_run_jsonl_path(
+                    base_output_dir=base_output_dir,
+                    mode="factor_view",
+                    model=m,
+                    run_idx=r_i,
+                )
                 write_jsonl(path, save_buf.get(m, []))
 
         for kk in METRIC_KEYS:
@@ -647,6 +706,7 @@ def evaluate_factor_view_stratum(
             "std_over_runs": std(xs),
             "ci95_over_runs": list(ci95_of_replicates(xs)),
             "runs": runs,
+            "replicate_means": xs,
         }
 
     return {
@@ -676,61 +736,61 @@ def print_dry_run_stats(
     models: Sequence[str],
     runs: int,
     sample_size: int,
+    mode: str,
 ) -> None:
-    quotas = allocate_quota(sample_size, len(models), random.Random(0))
+    rng = random.Random(0)
+    quotas = allocate_quota(sample_size, len(models), rng)
     plan = {m: q for m, q in zip(models, quotas)}
+
     logger.info("=== DRY RUN STATS ===")
+    logger.info("Mode: {}", mode)
     logger.info("Index total rows: {}", len(rows_all))
     logger.info("After stratum filters: {}", len(rows_filtered))
     logger.info("After missing-check kept: {}", len(rows_kept))
     logger.info("Missing report: {}", missing_report)
-    logger.info(
-        "Sampling plan: runs={}, sample_size_per_run_total={}", runs, sample_size
-    )
+    logger.info("Sampling: runs={}, sample_size_per_run_total={}", runs, sample_size)
     logger.info("Per-run per-model quota (even split): {}", plan)
 
-
-def build_summary_filename(
-    *,
-    mode: str,
-    models: Sequence[str],
-    visual_type: Optional[str],
-    sentiment_polarity: Optional[str],
-    layout_type: Optional[str],
-    runs: int,
-    sample_size: int,
-) -> str:
-    """
-    Build a self-descriptive filename for the evaluation summary.
-    """
-    parts: List[str] = []
-
-    parts.append("models=" + "+".join(models))
-
-    if mode == "factor_view":
-        parts.append(f"vt={visual_type or 'all'}")
-        parts.append(f"sp={sentiment_polarity or 'all'}")
-        parts.append(f"lt={layout_type or 'all'}")
-
-    parts.append(f"runs={runs}")
-    parts.append(f"n={sample_size}")
-
-    return "__".join(parts) + ".json"
+    # model_view total calls per run = sample_size * n_models
+    if mode == "model_view":
+        logger.info(
+            "Planned evaluations (per run): {} rows × {} models = {} samples",
+            sample_size,
+            len(models),
+            sample_size * len(models),
+        )
+        logger.info(
+            "Planned evaluations (total): {}",
+            runs * sample_size * len(models),
+        )
+    else:
+        logger.info(
+            "Planned evaluations (per run): {} (split over {} models) = {} samples",
+            sample_size,
+            len(models),
+            sample_size,
+        )
+        logger.info("Planned evaluations (total): {}", runs * sample_size)
 
 
-def build_experiment_dirname(
-    *,
-    models: Sequence[str],
-    visual_type: Optional[str],
-    sentiment_polarity: Optional[str],
-    layout_type: Optional[str],
-) -> str:
-    parts: List[str] = []
-    parts.append("models=" + "+".join(models))
-    parts.append(f"vt={visual_type or 'all'}")
-    parts.append(f"sp={sentiment_polarity or 'all'}")
-    parts.append(f"lt={layout_type or 'all'}")
-    return "__".join(parts)
+# =============================
+# Model discovery
+# =============================
+
+
+def discover_models(gen_root: str) -> List[str]:
+    if not os.path.isdir(gen_root):
+        raise ValueError(f"gen_root is not a directory: {gen_root}")
+
+    models: List[str] = []
+    for name in sorted(os.listdir(gen_root)):
+        path = os.path.join(gen_root, name)
+        if os.path.isdir(path):
+            models.append(name)
+
+    if not models:
+        raise ValueError(f"No model subdirectories found under gen_root={gen_root}")
+    return models
 
 
 # =============================
@@ -769,9 +829,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     p.add_argument(
         "--models",
-        required=True,
+        default=None,
         nargs="+",
-        help="One or more model subdir names under --gen-root.",
+        help="One or more model subdir names under --gen-root. If omitted, auto-discover all subdirs.",
     )
 
     p.add_argument(
@@ -861,7 +921,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=128,
         help="Client max in-flight requests (default 128).",
     )
-
     p.add_argument(
         "--timeout-s",
         type=float,
@@ -872,18 +931,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--max-retries", type=int, default=6, help="Max retries (default 6)."
     )
 
-    # NEW: dry run
     p.add_argument(
         "--dry-run",
         action="store_true",
         help="Only print stats and sampling plan; do not call judge.",
     )
 
-    # NEW: saving payloads
     p.add_argument(
         "--output-save-dir",
         default="./eval_outputs",
-        help="Directory to save per-run jsonl outputs (default ./eval_outputs).",
+        help="Directory to save per-run jsonl outputs.",
     )
     p.add_argument(
         "--no-output-save",
@@ -894,7 +951,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--out",
         default="./summaries",
-        help="Optional output JSON directory; empty => current directory.",
+        help="Summary output ROOT directory. Summary is saved to out/{mode}/{filename}.json",
     )
     p.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
 
@@ -932,12 +989,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logger.error("--sample-size and --runs must be > 0")
         return 2
 
-    # load index
+    mode = "model_view" if args.mode_model_view else "factor_view"
+
+    # load + filter
     rows_all = load_index(args.index)
     logger.info("Loaded index rows: {}", len(rows_all))
     overview_before = aggregate_counts(rows_all)
 
-    # filter to the specified stratum (single-or-none)
     rows_filtered = filter_rows_single(
         rows_all,
         visual_type=visual_type,
@@ -946,9 +1004,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     logger.info("After field filters (stratum): {}", len(rows_filtered))
 
-    # verify missing for requested models
+    # resolve models
+    if not args.models:
+        logger.info(
+            "No --models specified. Discovering all model subdirectories under {}",
+            args.gen_root,
+        )
+        try:
+            models = discover_models(args.gen_root)
+        except Exception as e:
+            logger.error(str(e))
+            return 2
+    else:
+        models = list(args.models)
+    logger.info("Using models: {}", models)
+
+    # missing-check
     rows_kept, missing_report = verify_missing(
-        rows_filtered, args.src_dir, args.gen_root, args.models
+        rows_filtered, args.src_dir, args.gen_root, models
     )
     logger.info("After missing-check keep: {}", len(rows_kept))
     if missing_report["missing_source"] > 0 or any(
@@ -961,25 +1034,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logger.error("No samples left after filtering + missing-check.")
         return 1
 
-    # dry run exits early
+    # experiment output dir for per-run payloads
+    exp_dirname = build_experiment_dirname(
+        models=models,
+        visual_type=visual_type,
+        sentiment_polarity=sentiment_polarity,
+        layout_type=layout_type,
+    )
+    base_output_dir = os.path.join(args.output_save_dir, exp_dirname)
+    save_outputs = not bool(args.no_output_save)
+
+    # dry run
     if bool(args.dry_run):
         print_dry_run_stats(
             rows_all=rows_all,
             rows_filtered=rows_filtered,
             rows_kept=rows_kept,
             missing_report=missing_report,
-            models=args.models,
+            models=models,
             runs=int(args.runs),
             sample_size=int(args.sample_size),
+            mode=mode,
         )
+        logger.info("Planned per-run jsonl save base dir: {}", base_output_dir)
         return 0
+
+    # ensure save dirs
+    if save_outputs:
+        for m in models:
+            _ensure_dir(os.path.join(base_output_dir, mode, m))
 
     # build client + pipeline
     client = JudgeClient(
         model=args.judge_model,
         retry=RetryConfig(
-            max_retries=int(args.max_retries),
-            timeout_s=float(args.timeout_s),
+            max_retries=int(args.max_retries), timeout_s=float(args.timeout_s)
         ),
         max_in_flight=int(args.max_in_flight),
         cache=CacheConfig(
@@ -1006,37 +1095,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cfg=cfg,
         ccfg=ConcurrencyConfig(sample_workers=int(args.sample_workers)),
         rcfg=RunConfig(
-            use_cache=bool(args.use_cache),
-            force_refresh=bool(args.force_refresh),
+            use_cache=bool(args.use_cache), force_refresh=bool(args.force_refresh)
         ),
     )
 
-    save_outputs = not bool(args.no_output_save)
-    base_ouptput_dir = ""
-    if save_outputs:
-        exp_dirname = build_experiment_dirname(
-            models=args.models,
-            visual_type=visual_type,
-            sentiment_polarity=sentiment_polarity,
-            layout_type=layout_type,
-        )
-
-        base_ouptput_dir = os.path.join(args.output_save_dir, exp_dirname)
-
-        if args.mode_model_view:
-            mode_dir = os.path.join(base_ouptput_dir, "model_view")
-        else:
-            mode_dir = os.path.join(base_ouptput_dir, "factor_view")
-
-        for m in args.models:
-            _ensure_dir(os.path.join(mode_dir, m))
-
-    # evaluate (exclusive mode)
-    if args.mode_model_view:
+    # evaluate
+    if mode == "model_view":
         results = {
             "model_view": evaluate_model_view(
                 rows=rows_kept,
-                models=args.models,
+                models=models,
                 src_dir=args.src_dir,
                 gen_root=args.gen_root,
                 pipeline=pipeline,
@@ -1044,11 +1112,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 sample_size=int(args.sample_size),
                 seed=int(args.seed),
                 compute_cost=bool(args.compute_cost),
-                save_dir=base_ouptput_dir,
+                base_output_dir=base_output_dir,
                 save_outputs=save_outputs,
             )
         }
-        mode = "model_view"
     else:
         stratum_label = {
             "visual_type": visual_type,
@@ -1058,7 +1125,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         results = {
             "factor_view": evaluate_factor_view_stratum(
                 rows=rows_kept,
-                models=args.models,
+                models=models,
                 src_dir=args.src_dir,
                 gen_root=args.gen_root,
                 pipeline=pipeline,
@@ -1067,18 +1134,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 seed=int(args.seed),
                 compute_cost=bool(args.compute_cost),
                 stratum_label=stratum_label,
-                save_dir=base_ouptput_dir,
+                base_output_dir=base_output_dir,
                 save_outputs=save_outputs,
             )
         }
-        mode = "factor_view"
 
     out_obj: Dict[str, Any] = {
         "config": {
             "index": args.index,
             "src_dir": args.src_dir,
             "gen_root": args.gen_root,
-            "models": list(args.models),
+            "models": models,
             "filters": {
                 "visual_type": visual_type,
                 "sentiment_polarity": sentiment_polarity,
@@ -1113,8 +1179,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "mode": mode,
             "saving": {
                 "enabled": bool(save_outputs),
-                "save_dir": base_ouptput_dir,
-                "layout": "save_dir/{mode}/{model}/{run}.jsonl",
+                "output_save_dir": args.output_save_dir,
+                "experiment_dir": exp_dirname,
+                "per_run_base_dir": base_output_dir,
+                "layout": "{output_save_dir}/{experiment}/{mode}/{model}/{run}.jsonl",
             },
         },
         "overview_before_filters": overview_before,
@@ -1122,37 +1190,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "overview_after_missing_filter": overview_after,
         "results": results,
         "notes": {
-            "dry_run": "If --dry-run is set, the program prints stats and exits without calling judge.",
-            "factor_view_behavior": "factor_view evaluates ONLY the specified filter-combination stratum (or all if none). Sampling is evenly split across models; metrics are pooled across models and summarized with mean/std/CI over runs.",
+            "dry_run": "If --dry-run is set, prints stats and exits without calling judge.",
+            "factor_view_behavior": "factor_view evaluates ONLY the specified filter-combination stratum. Sampling is evenly split across models; metrics pooled across models and summarized with mean/std/CI over runs.",
+            "model_view_behavior": "model_view samples rows each run and evaluates ALL models on the same sampled rows.",
             "cost_behavior": "Cost is summed ONLY for non-cache calls, using cost_info['estimated_cost_usd'] returned by judge.py.",
-            "save_outputs": "Per-run outputs are saved as JSONL per model under save_dir/{mode}/{model}/{run}.jsonl; each line includes row_id/gen_id/model and the full pipeline output item.",
+            "save_outputs": "Per-run outputs are saved as JSONL per model; each line includes row_id/gen_id/model and the full pipeline output item.",
         },
     }
 
-    js = json.dumps(out_obj, ensure_ascii=False, indent=2)
-
-    # output directory (required conceptually; default to cwd if not given)
+    # save summary JSON to out/{mode}/{filename}.json
     out_root = args.out or "."
-
-    # subdir = mode
     mode_dir = os.path.join(out_root, mode)
-    os.makedirs(mode_dir, exist_ok=True)
+    _ensure_dir(mode_dir)
 
     fname = build_summary_filename(
         mode=mode,
-        models=args.models,
+        models=models,
         visual_type=visual_type,
         sentiment_polarity=sentiment_polarity,
         layout_type=layout_type,
         runs=int(args.runs),
         sample_size=int(args.sample_size),
     )
-
     out_path = os.path.join(mode_dir, fname)
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(js)
-
+    write_json(out_path, out_obj)
     logger.info("Wrote summary to {}", out_path)
 
     return 0
