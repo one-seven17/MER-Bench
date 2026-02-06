@@ -33,7 +33,7 @@ def test_judge_example():
         images_first=True,
         temperature=0.0,
         max_output_tokens=900,
-        cost=CostConfig(enabled=True),  # <---- 开关：是否输出 cost 字段
+        cost=CostConfig(enabled=True),
     )
 
     pipeline = JudgePipeline(

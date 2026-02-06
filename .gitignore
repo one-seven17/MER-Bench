@@ -232,3 +232,4 @@ data
 # Output directories
 *outputs
 summaries
+archived-results
