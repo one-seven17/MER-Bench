@@ -350,32 +350,47 @@ def build_experiment_dirname(
     visual_type: Optional[str],
     sentiment_polarity: Optional[str],
     layout_type: Optional[str],
+    rationale_first: bool,
+    images_first: bool,
+    sample_size: int,
+    runs: int,
+    seed: int,
 ) -> str:
     parts: List[str] = []
     parts.append("models=" + "+".join(models))
     parts.append(f"vt={visual_type or 'all'}")
     parts.append(f"sp={sentiment_polarity or 'all'}")
     parts.append(f"lt={layout_type or 'all'}")
+    parts.append(f"n={sample_size}")
+    parts.append(f"runs={runs}")
+    parts.append(f"seed={seed}")
+    parts.append("ra=first" if rationale_first else "ra=last")
+    parts.append("im=first" if images_first else "im=last")
     return _safe_slug("__".join(parts))
 
 
 def build_summary_filename(
     *,
-    mode: str,
     models: Sequence[str],
     visual_type: Optional[str],
     sentiment_polarity: Optional[str],
     layout_type: Optional[str],
-    runs: int,
+    rationale_first: bool,
+    images_first: bool,
     sample_size: int,
+    runs: int,
+    seed: int,
 ) -> str:
     parts: List[str] = []
     parts.append("models=" + "+".join(models))
     parts.append(f"vt={visual_type or 'all'}")
     parts.append(f"sp={sentiment_polarity or 'all'}")
     parts.append(f"lt={layout_type or 'all'}")
-    parts.append(f"runs={runs}")
     parts.append(f"n={sample_size}")
+    parts.append(f"runs={runs}")
+    parts.append(f"seed={seed}")
+    parts.append("ra=first" if rationale_first else "ra=last")
+    parts.append("im=first" if images_first else "im=last")
     return _safe_slug("__".join(parts)) + ".json"
 
 
@@ -1040,6 +1055,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         visual_type=visual_type,
         sentiment_polarity=sentiment_polarity,
         layout_type=layout_type,
+        rationale_first=rationale_first,
+        images_first=images_first,
+        sample_size=args.sample_size,
+        runs=args.runs,
+        seed=args.seed,
     )
     base_output_dir = os.path.join(args.output_save_dir, exp_dirname)
     save_outputs = not bool(args.no_output_save)
@@ -1204,13 +1224,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _ensure_dir(mode_dir)
 
     fname = build_summary_filename(
-        mode=mode,
         models=models,
         visual_type=visual_type,
         sentiment_polarity=sentiment_polarity,
         layout_type=layout_type,
         runs=int(args.runs),
         sample_size=int(args.sample_size),
+        seed=int(args.seed),
+        rationale_first=bool(rationale_first),
+        images_first=bool(images_first),
     )
     out_path = os.path.join(mode_dir, fname)
 
