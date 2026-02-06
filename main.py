@@ -1113,7 +1113,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "mode": mode,
             "saving": {
                 "enabled": bool(save_outputs),
-                "save_dir": mode_dir,
+                "save_dir": base_ouptput_dir,
                 "layout": "save_dir/{mode}/{model}/{run}.jsonl",
             },
         },
