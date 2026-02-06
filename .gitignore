@@ -228,3 +228,7 @@ __marimo__/
 
 # Dataset
 data
+
+# Output directories
+*outputs
+summaries

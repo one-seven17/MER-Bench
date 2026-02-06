@@ -17,6 +17,12 @@ Behaviors (latest):
    - Aggregation is from stratum perspective (models marginalized), report mean/std/CI over runs.
 6) Supports configurable concurrency: --sample-workers and --max-in-flight.
 7) Optional cost accumulation excludes cache hits.
+
+NEW:
+8) --dry-run: only stats + sampling plan, no judge calls.
+9) Save per-run jsonl outputs by model under:
+     save_dir/{model_view|factor_view}/{model}/{run_idx}.jsonl
+   Each line records sampled row_id/gen_id and the out item from pipeline.
 """
 
 from __future__ import annotations
@@ -309,6 +315,22 @@ def sample_rows(
 
 
 # =============================
+# Output saving helpers
+# =============================
+
+
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def write_jsonl(path: str, records: Sequence[Dict[str, Any]]) -> None:
+    _ensure_dir(os.path.dirname(path) or ".")
+    with open(path, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+# =============================
 # Sample builder (embed model in sample_id for bookkeeping)
 # =============================
 
@@ -331,6 +353,10 @@ def make_sample(
 
 def parse_model_from_sample_id(sample_id: str) -> str:
     return sample_id.split("::", 1)[1] if "::" in sample_id else ""
+
+
+def parse_row_id_from_sample_id(sample_id: str) -> str:
+    return sample_id.split("::", 1)[0] if "::" in sample_id else sample_id
 
 
 # =============================
@@ -379,7 +405,6 @@ def update_book(
     cost_info: Optional[Dict[str, Any]],
     compute_cost: bool,
 ) -> None:
-    # init per_model
     if "per_model" not in book:
         book["per_model"] = {}
 
@@ -391,7 +416,6 @@ def update_book(
             "errors": 0,
         }
 
-    # init overall
     if "overall" not in book:
         book["overall"] = {
             "api_calls": 0,
@@ -400,19 +424,16 @@ def update_book(
             "errors": 0,
         }
 
-    # error
     if "error" in payload:
         book["per_model"][model]["errors"] += 1
         book["overall"]["errors"] += 1
         return
 
-    # cache hit (no cost)
     if cache_flag(payload):
         book["per_model"][model]["cache_hits"] += 1
         book["overall"]["cache_hits"] += 1
         return
 
-    # api call
     book["per_model"][model]["api_calls"] += 1
     book["overall"]["api_calls"] += 1
 
@@ -433,6 +454,8 @@ def evaluate_model_view(
     sample_size: int,
     seed: int,
     compute_cost: bool,
+    save_dir: str,
+    save_outputs: bool,
 ) -> Dict[str, Any]:
     rng = random.Random(seed)
 
@@ -440,6 +463,9 @@ def evaluate_model_view(
         m: {k: [] for k in METRIC_KEYS} for m in models
     }
     book = init_book(models)
+
+    # map for row lookup by id (for saving gen_id, etc.)
+    row_by_id: Dict[str, Dict[str, Any]] = {str(r.get("id")): r for r in rows}
 
     for r_i in range(runs):
         batch_rows = sample_rows(rows, k=sample_size, rng=rng)
@@ -458,6 +484,9 @@ def evaluate_model_view(
             m: {k: [] for k in METRIC_KEYS} for m in models
         }
 
+        # saving buffers per model
+        save_buf: Dict[str, List[Dict[str, Any]]] = {m: [] for m in models}
+
         for item in results:
             sample_obj = item.get("sample", {})
             sample_id = str(sample_obj.get("sample_id", ""))
@@ -466,6 +495,21 @@ def evaluate_model_view(
             cost_info = item.get("cost") if isinstance(item, dict) else None
 
             update_book(book, model, payload, cost_info, compute_cost)
+
+            # save (id + out)
+            if save_outputs and model in save_buf:
+                row_id = parse_row_id_from_sample_id(sample_id)
+                row = row_by_id.get(row_id, {})
+                save_buf[model].append(
+                    {
+                        "run": r_i,
+                        "row_id": row_id,
+                        "gen_id": row.get("gen_id"),
+                        "model": model,
+                        "out": item,
+                    }
+                )
+
             if not isinstance(payload, dict) or "error" in payload:
                 continue
 
@@ -473,6 +517,12 @@ def evaluate_model_view(
             metrics = extract_metrics(payload, tgt)
             for kk, vv in metrics.items():
                 run_vals[model][kk].append(float(vv))
+
+        # flush saved jsonl per run per model
+        if save_outputs:
+            for m in models:
+                path = os.path.join(save_dir, "model_view", m, f"{r_i}.jsonl")
+                write_jsonl(path, save_buf.get(m, []))
 
         for m in models:
             for kk in METRIC_KEYS:
@@ -508,6 +558,8 @@ def evaluate_factor_view_stratum(
     seed: int,
     compute_cost: bool,
     stratum_label: Dict[str, Optional[str]],
+    save_dir: str,
+    save_outputs: bool,
 ) -> Dict[str, Any]:
     """
     factor_view (models marginalized), but ONLY for the given stratum:
@@ -519,6 +571,8 @@ def evaluate_factor_view_stratum(
 
     rep_means: Dict[str, List[float]] = {k: [] for k in METRIC_KEYS}
     book = init_book(models)
+
+    row_by_id: Dict[str, Dict[str, Any]] = {str(r.get("id")): r for r in rows}
 
     for r_i in range(runs):
         quotas = allocate_quota(sample_size, len(models), rng)
@@ -537,6 +591,8 @@ def evaluate_factor_view_stratum(
 
         pooled_vals: Dict[str, List[float]] = {k: [] for k in METRIC_KEYS}
 
+        save_buf: Dict[str, List[Dict[str, Any]]] = {m: [] for m in models}
+
         for item in results:
             sample_obj = item.get("sample", {})
             sample_id = str(sample_obj.get("sample_id", ""))
@@ -545,6 +601,20 @@ def evaluate_factor_view_stratum(
             cost_info = item.get("cost") if isinstance(item, dict) else None
 
             update_book(book, model, payload, cost_info, compute_cost)
+
+            if save_outputs and model in save_buf:
+                row_id = parse_row_id_from_sample_id(sample_id)
+                row = row_by_id.get(row_id, {})
+                save_buf[model].append(
+                    {
+                        "run": r_i,
+                        "row_id": row_id,
+                        "gen_id": row.get("gen_id"),
+                        "model": model,
+                        "out": item,
+                    }
+                )
+
             if not isinstance(payload, dict) or "error" in payload:
                 continue
 
@@ -552,6 +622,12 @@ def evaluate_factor_view_stratum(
             metrics = extract_metrics(payload, tgt)
             for kk, vv in metrics.items():
                 pooled_vals[kk].append(float(vv))
+
+        # flush saved jsonl per run per model
+        if save_outputs:
+            for m in models:
+                path = os.path.join(save_dir, "factor_view", m, f"{r_i}.jsonl")
+                write_jsonl(path, save_buf.get(m, []))
 
         for kk in METRIC_KEYS:
             rep_means[kk].append(mean(pooled_vals[kk]))
@@ -584,6 +660,77 @@ def evaluate_factor_view_stratum(
             "even_split_over_models": True,
         },
     }
+
+
+# =============================
+# Dry run stats
+# =============================
+
+
+def print_dry_run_stats(
+    *,
+    rows_all: Sequence[Dict[str, Any]],
+    rows_filtered: Sequence[Dict[str, Any]],
+    rows_kept: Sequence[Dict[str, Any]],
+    missing_report: Dict[str, Any],
+    models: Sequence[str],
+    runs: int,
+    sample_size: int,
+) -> None:
+    quotas = allocate_quota(sample_size, len(models), random.Random(0))
+    plan = {m: q for m, q in zip(models, quotas)}
+    logger.info("=== DRY RUN STATS ===")
+    logger.info("Index total rows: {}", len(rows_all))
+    logger.info("After stratum filters: {}", len(rows_filtered))
+    logger.info("After missing-check kept: {}", len(rows_kept))
+    logger.info("Missing report: {}", missing_report)
+    logger.info(
+        "Sampling plan: runs={}, sample_size_per_run_total={}", runs, sample_size
+    )
+    logger.info("Per-run per-model quota (even split): {}", plan)
+
+
+def build_summary_filename(
+    *,
+    mode: str,
+    models: Sequence[str],
+    visual_type: Optional[str],
+    sentiment_polarity: Optional[str],
+    layout_type: Optional[str],
+    runs: int,
+    sample_size: int,
+) -> str:
+    """
+    Build a self-descriptive filename for the evaluation summary.
+    """
+    parts: List[str] = []
+
+    parts.append("models=" + "+".join(models))
+
+    if mode == "factor_view":
+        parts.append(f"vt={visual_type or 'all'}")
+        parts.append(f"sp={sentiment_polarity or 'all'}")
+        parts.append(f"lt={layout_type or 'all'}")
+
+    parts.append(f"runs={runs}")
+    parts.append(f"n={sample_size}")
+
+    return "__".join(parts) + ".json"
+
+
+def build_experiment_dirname(
+    *,
+    models: Sequence[str],
+    visual_type: Optional[str],
+    sentiment_polarity: Optional[str],
+    layout_type: Optional[str],
+) -> str:
+    parts: List[str] = []
+    parts.append("models=" + "+".join(models))
+    parts.append(f"vt={visual_type or 'all'}")
+    parts.append(f"sp={sentiment_polarity or 'all'}")
+    parts.append(f"lt={layout_type or 'all'}")
+    return "__".join(parts)
 
 
 # =============================
@@ -725,8 +872,29 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--max-retries", type=int, default=6, help="Max retries (default 6)."
     )
 
+    # NEW: dry run
     p.add_argument(
-        "--out", default="", help="Optional output JSON path; empty => stdout."
+        "--dry-run",
+        action="store_true",
+        help="Only print stats and sampling plan; do not call judge.",
+    )
+
+    # NEW: saving payloads
+    p.add_argument(
+        "--output-save-dir",
+        default="./eval_outputs",
+        help="Directory to save per-run jsonl outputs (default ./eval_outputs).",
+    )
+    p.add_argument(
+        "--no-output-save",
+        action="store_true",
+        help="Disable saving per-run jsonl outputs.",
+    )
+
+    p.add_argument(
+        "--out",
+        default="./summaries",
+        help="Optional output JSON directory; empty => current directory.",
     )
     p.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
 
@@ -793,6 +961,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logger.error("No samples left after filtering + missing-check.")
         return 1
 
+    # dry run exits early
+    if bool(args.dry_run):
+        print_dry_run_stats(
+            rows_all=rows_all,
+            rows_filtered=rows_filtered,
+            rows_kept=rows_kept,
+            missing_report=missing_report,
+            models=args.models,
+            runs=int(args.runs),
+            sample_size=int(args.sample_size),
+        )
+        return 0
+
     # build client + pipeline
     client = JudgeClient(
         model=args.judge_model,
@@ -830,6 +1011,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ),
     )
 
+    save_outputs = not bool(args.no_output_save)
+    base_ouptput_dir = ""
+    if save_outputs:
+        exp_dirname = build_experiment_dirname(
+            models=args.models,
+            visual_type=visual_type,
+            sentiment_polarity=sentiment_polarity,
+            layout_type=layout_type,
+        )
+
+        base_ouptput_dir = os.path.join(args.output_save_dir, exp_dirname)
+
+        if args.mode_model_view:
+            mode_dir = os.path.join(base_ouptput_dir, "model_view")
+        else:
+            mode_dir = os.path.join(base_ouptput_dir, "factor_view")
+
+        for m in args.models:
+            _ensure_dir(os.path.join(mode_dir, m))
+
     # evaluate (exclusive mode)
     if args.mode_model_view:
         results = {
@@ -843,6 +1044,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 sample_size=int(args.sample_size),
                 seed=int(args.seed),
                 compute_cost=bool(args.compute_cost),
+                save_dir=base_ouptput_dir,
+                save_outputs=save_outputs,
             )
         }
         mode = "model_view"
@@ -864,6 +1067,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 seed=int(args.seed),
                 compute_cost=bool(args.compute_cost),
                 stratum_label=stratum_label,
+                save_dir=base_ouptput_dir,
+                save_outputs=save_outputs,
             )
         }
         mode = "factor_view"
@@ -906,25 +1111,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "timeout_s": float(args.timeout_s),
             },
             "mode": mode,
+            "saving": {
+                "enabled": bool(save_outputs),
+                "save_dir": mode_dir,
+                "layout": "save_dir/{mode}/{model}/{run}.jsonl",
+            },
         },
         "overview_before_filters": overview_before,
         "missing_report": missing_report,
         "overview_after_missing_filter": overview_after,
         "results": results,
         "notes": {
+            "dry_run": "If --dry-run is set, the program prints stats and exits without calling judge.",
             "factor_view_behavior": "factor_view evaluates ONLY the specified filter-combination stratum (or all if none). Sampling is evenly split across models; metrics are pooled across models and summarized with mean/std/CI over runs.",
             "cost_behavior": "Cost is summed ONLY for non-cache calls, using cost_info['estimated_cost_usd'] returned by judge.py.",
+            "save_outputs": "Per-run outputs are saved as JSONL per model under save_dir/{mode}/{model}/{run}.jsonl; each line includes row_id/gen_id/model and the full pipeline output item.",
         },
     }
 
     js = json.dumps(out_obj, ensure_ascii=False, indent=2)
-    if args.out:
-        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-        with open(args.out, "w", encoding="utf-8") as f:
-            f.write(js)
-        logger.info("Wrote output to {}", args.out)
-    else:
-        print(js)
+
+    # output directory (required conceptually; default to cwd if not given)
+    out_root = args.out or "."
+
+    # subdir = mode
+    mode_dir = os.path.join(out_root, mode)
+    os.makedirs(mode_dir, exist_ok=True)
+
+    fname = build_summary_filename(
+        mode=mode,
+        models=args.models,
+        visual_type=visual_type,
+        sentiment_polarity=sentiment_polarity,
+        layout_type=layout_type,
+        runs=int(args.runs),
+        sample_size=int(args.sample_size),
+    )
+
+    out_path = os.path.join(mode_dir, fname)
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(js)
+
+    logger.info("Wrote summary to {}", out_path)
 
     return 0
 
