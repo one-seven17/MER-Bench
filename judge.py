@@ -366,69 +366,158 @@ class PromptBundle:
 
 
 class PromptBuilder:
+    """
+    PromptBuilder for Meme Reappraisal evaluation.
+
+    Design goals:
+    - Per-field rationale is REQUIRED and must be scoped (no copy/paste global rationale).
+    - Emotion accuracy scores are TARGET-gated (if not match TARGET => <=2).
+    - Emotion classification is 9-way: 8 + other, with other_emotion required iff label=='other'.
+    - Layout consistency explicitly checks single vs multi-panel/grid.
+    """
+
     @staticmethod
-    def build_prompts(sample: MemeSample) -> PromptBundle:
+    def _maybe_block(title: str, content: Optional[str]) -> Optional[str]:
+        if content is None:
+            return None
+        t = str(content).strip()
+        if not t:
+            return None
+        return f"{title}:\n{t}"
+
+    @staticmethod
+    def build_prompts(sample: "MemeSample") -> PromptBundle:
+        # Keep this hint; model generally respects it when schema is strict.
         order_hint = (
             "Output JSON keys in the exact order implied by the schema. "
             "Do not add extra keys."
         )
 
         system_prompt = (
-            "You are a strict expert judge for meme emotion reframing.\n"
-            "You MUST compare SOURCE vs EDITED.\n"
-            "ONLY the affect/emotion should change; everything else should remain consistent.\n"
+            "You are an expert evaluator for the task: Meme Reappraisal.\n"
             "\n"
-            "Critical rules:\n"
-            "1) Layout/structure: Preserve panel/grid structure. If SOURCE is single-panel, EDITED must be single-panel.\n"
-            "   If SOURCE is multi-panel/grid meme, EDITED must also be multi-panel/grid and preserve panel order and caption regions.\n"
-            "2) Emotion scoring MUST be target-gated:\n"
-            "   - All emotion-related scores shown in the JSON must first check alignment with TARGET emotion.\n"
-            "   - If EDITED does NOT match TARGET emotion, emotion_accuracy_1_5 MUST be <= 2.\n"
-            "3) Emotion classification:\n"
-            "   - Choose ONE primary emotion label for the EDITED meme.\n"
-            "   - If it fits none of the 8 predefined labels, use label='other' and set other_emotion to the concrete emotion name.\n"
-            "   - If label != 'other', set other_emotion to null.\n"
-            "4) Text-visual semantic alignment:\n"
-            "   - In rationales, explicitly mention whether the caption and visual cues jointly support the same scenario and intended affect.\n"
+            "You will be given:\n"
+            "- SOURCE meme image (with overlaid text)\n"
+            "- EDITED meme image (with overlaid text)\n"
+            "- Reference labels: SOURCE emotion and TARGET emotion\n"
+            "- Optional reference captions and an editing instruction\n"
             "\n"
-            f"{order_hint}\n"
-            "Return JSON only."
+            "Your job is to compare SOURCE vs EDITED and output ONLY a JSON object that strictly follows "
+            "the provided JSON schema.\n"
+            "\n"
+            "Global constraints (apply to ALL judgments):\n"
+            "A) Content preservation (same scenario/joke):\n"
+            "   The EDITED meme must preserve the same situation, entities/identity, and core meaning as SOURCE.\n"
+            "   Penalize if the topic changes, new objects/events appear, or the implied situation differs.\n"
+            "\n"
+            "B) Layout/structure preservation (meme format):\n"
+            "   If SOURCE is single-panel, EDITED must be single-panel.\n"
+            "   If SOURCE is multi-panel/grid, EDITED must also be multi-panel/grid and preserve panel order "
+            "and caption regions.\n"
+            "   Any mismatch => layout_consistency.consistent = false.\n"
+            "\n"
+            "C) Target-gated emotion accuracy:\n"
+            "   All emotion_accuracy_1_5 scores must first check whether EDITED matches the given TARGET emotion.\n"
+            "   If EDITED does NOT match TARGET emotion, emotion_accuracy_1_5 MUST be <= 2 (no exceptions).\n"
+            "\n"
+            "D) RATIONALE SCOPE RULE (critical):\n"
+            "   Each field has its own rationale. The rationale inside each block MUST explain ONLY that block’s "
+            "score/decision.\n"
+            "   Do NOT copy the same rationale across blocks.\n"
+            "   Every rationale MUST explicitly mention:\n"
+            "   (1) TARGET emotion alignment (match / not match),\n"
+            "   (2) scenario preservation (preserved / drifted),\n"
+            "   (3) text-visual semantic alignment (aligned / conflicting / unclear).\n"
+            "\n"
+            "E) Emotion classification labels:\n"
+            f"   overall_emotion_classification.label must be one of: {', '.join(EMOTIONS_9)}.\n"
+            "   Choose the ONE primary emotion you perceive in the EDITED meme (not what it 'should' be).\n"
+            "   If none of the 8 labels fit, use label='other' AND set other_emotion to a specific emotion name.\n"
+            "   If label != 'other', other_emotion MUST be null.\n"
+            "\n"
+            "Output requirements:\n"
+            "- Return JSON only.\n"
+            "- Do not add keys outside the schema.\n"
+            f"- {order_hint}\n"
         )
 
+        # ---- User text: task context + per-field rubrics (this is the key fix) ----
         user_lines: List[str] = []
         user_lines.append(
-            f"Allowed emotions (classification): {', '.join(EMOTIONS_8)} + other"
+            "Task: Evaluate the EDITED meme for Meme Reappraisal given SOURCE and TARGET references."
+        )
+        user_lines.append(
+            f"Allowed classification labels: {', '.join(EMOTIONS_8)} + other"
         )
         user_lines.append(f"SOURCE emotion (reference): {sample.src_emotion}")
         user_lines.append(f"TARGET emotion (reference): {sample.tgt_emotion}")
 
-        if sample.src_caption_text:
-            user_lines.append(f"SOURCE caption (reference):\n{sample.src_caption_text}")
-        if sample.tgt_caption_text:
-            user_lines.append(f"TARGET caption (reference):\n{sample.tgt_caption_text}")
-        if sample.edit_instruction:
-            user_lines.append(
-                f"Editing instruction (reference):\n{sample.edit_instruction}"
-            )
+        # Optional references in a clean block
+        opt_blocks: List[str] = []
+        b = PromptBuilder._maybe_block(
+            "SOURCE caption (reference)", sample.src_caption_text
+        )
+        if b:
+            opt_blocks.append(b)
+        b = PromptBuilder._maybe_block(
+            "TARGET caption (reference)", sample.tgt_caption_text
+        )
+        if b:
+            opt_blocks.append(b)
+        b = PromptBuilder._maybe_block(
+            "Editing instruction (reference)", sample.edit_instruction
+        )
+        if b:
+            opt_blocks.append(b)
+
+        if opt_blocks:
+            user_lines.append("Optional references:\n" + "\n\n".join(opt_blocks))
 
         user_lines.append(
-            "Scoring instructions:\n"
-            "- visual_assessment.generation_quality_1_5: visual cleanliness / realism / artifact-free.\n"
-            "- visual_assessment.emotion_accuracy_1_5: ONLY based on visual cues matching TARGET emotion; if not matched => <=2.\n"
-            "- text_assessment.generation_quality_1_5: text legibility, completeness, placement.\n"
-            "- text_assessment.emotion_accuracy_1_5: text affect matches TARGET emotion while describing the same scenario; if not matched => <=2.\n"
-            "- layout_consistency.consistent: true ONLY if panel/grid type and layout match SOURCE (single vs multi-grid).\n"
-            "- overall_emotion_classification: primary emotion of EDITED (8 labels or 'other').\n"
-            "- perceived_emotion_shift.magnitude_1_5: perceived change magnitude from SOURCE to EDITED.\n"
-            "- overall_generation_quality.overall_generation_quality_1_5: holistic output quality.\n"
+            "Scoring rubric (you MUST follow this per-field; rationales are NOT interchangeable):\n"
             "\n"
-            "Be strict: if non-affective elements drift (subject identity, style, layout, scenario), penalize accordingly.\n"
-            "In each rationale, explicitly state: (a) TARGET emotion alignment, (b) scenario preservation, (c) text-visual semantic alignment."
+            "1) visual_assessment\n"
+            "- generation_quality_1_5: visual cleanliness, artifacts, realism/style coherence, readability of visual details.\n"
+            "- emotion_accuracy_1_5: based ONLY on VISUAL affect cues matching TARGET emotion "
+            "(facial expression, posture, lighting mood, color tone, tension/relaxation, etc.).\n"
+            "  If NOT matching TARGET => emotion_accuracy_1_5 MUST be <= 2.\n"
+            "- rationale: must explicitly state (a) whether visual affect matches TARGET, "
+            "(b) whether scenario/identity is preserved, "
+            "(c) whether visual cues support the overlaid text emotionally.\n"
+            "\n"
+            "2) text_assessment\n"
+            "- generation_quality_1_5: text legibility, not garbled, not cropped, consistent font/outline, placed naturally.\n"
+            "- emotion_accuracy_1_5: whether the TEXT tone/wording expresses the TARGET emotion while describing the SAME scenario.\n"
+            "  If NOT matching TARGET => emotion_accuracy_1_5 MUST be <= 2.\n"
+            "- rationale: must explicitly state (a) whether text tone matches TARGET, "
+            "(b) whether text keeps the same scenario/joke, "
+            "(c) whether text meaning aligns with the visual cues (aligned/conflicting/unclear).\n"
+            "\n"
+            "3) layout_consistency\n"
+            "- consistent: true ONLY if layout type matches SOURCE (single vs multi-panel/grid) AND panel/caption regions are preserved.\n"
+            "- rationale: MUST explicitly compare SOURCE vs EDITED on: "
+            "(a) single vs multi-panel/grid, "
+            "(b) panel count/order (if multi), "
+            "(c) caption regions/placement.\n"
+            "\n"
+            "4) overall_emotion_classification\n"
+            "- label: choose the ONE primary emotion you perceive in the EDITED meme (may differ from TARGET).\n"
+            "- other_emotion: if and only if label='other', provide a specific emotion name (e.g., 'proud', 'annoyed', 'serene').\n"
+            "- rationale: justify the chosen label using BOTH visual + text evidence; also state whether it matches TARGET or not.\n"
+            "\n"
+            "5) perceived_emotion_shift\n"
+            "- magnitude_1_5: how strong the emotional change feels from SOURCE to EDITED "
+            "(1=very small, 5=very large).\n"
+            "- rationale: compare SOURCE affect vs EDITED affect; mention if shift fails because TARGET not achieved or content drifted.\n"
+            "\n"
+            "6) overall_generation_quality\n"
+            "- overall_generation_quality_1_5: holistic quality considering emotion success (TARGET), content preservation, "
+            "layout preservation, and overall readability.\n"
+            "- rationale: summarize the main factors that drove the overall score, but DO NOT repeat earlier rationales verbatim.\n"
         )
 
-        return PromptBundle(
-            system_prompt=system_prompt, user_text="\n\n".join(user_lines)
-        )
+        user_text = "\n\n".join(user_lines)
+        return PromptBundle(system_prompt=system_prompt, user_text=user_text)
 
 
 class InputBuilder:
@@ -437,12 +526,12 @@ class InputBuilder:
         src_img = {
             "type": "input_image",
             "image_url": image_to_data_url(sample.src_image_path),
-            "detail": "high",
+            "detail": "auto",
         }
         gen_img = {
             "type": "input_image",
             "image_url": image_to_data_url(sample.gen_image_path),
-            "detail": "high",
+            "detail": "auto",
         }
         return [
             {"type": "input_text", "text": "SOURCE image:"},
