@@ -890,7 +890,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--db", default="db.sqlite3", help="SQLite cache db path.")
 
     p.add_argument(
-        "--judge-model", default="gpt-5.2", help="Judge model name (default gpt-5.2)."
+        "--judge-model",
+        default="gemini-3-pro-preview",
+        help="Judge model name (default gemini-3-pro-preview).",
     )
     p.add_argument("--max-output-tokens", type=int, default=900)
     p.add_argument("--temperature", type=float, default=0.0)
