@@ -3,6 +3,7 @@ name = "meme-reframing-bench"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
+    "google-genai>=1.62.0",
     "huggingface-hub[cli]>=1.4.0",
     "jsonlines>=4.0.0",
     "loguru>=0.7.3",

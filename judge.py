@@ -312,7 +312,7 @@ def build_judge_schema(rationale_first: bool) -> Tuple[str, Dict[str, Any]]:
         rationale_first,
         core_fields=[
             ("label", {"type": "string", "enum": EMOTIONS_9}),
-            ("other_emotion", {"type": ["string", "null"]}),
+            ("other_emotion", {"type": "string", "nullable": True}),
         ],
     )
 
@@ -524,25 +524,25 @@ class InputBuilder:
     @staticmethod
     def build_image_blocks(sample: MemeSample) -> List[Dict[str, Any]]:
         src_img = {
-            "type": "input_image",
+            "type": "image_url",
             "image_url": image_to_data_url(sample.src_image_path),
             "detail": "auto",
         }
         gen_img = {
-            "type": "input_image",
+            "type": "image_url",
             "image_url": image_to_data_url(sample.gen_image_path),
             "detail": "auto",
         }
         return [
-            {"type": "input_text", "text": "SOURCE image:"},
+            {"type": "text", "text": "SOURCE image:"},
             src_img,
-            {"type": "input_text", "text": "EDITED image:"},
+            {"type": "text", "text": "EDITED image:"},
             gen_img,
         ]
 
     @staticmethod
     def build_text_block(user_text: str) -> List[Dict[str, Any]]:
-        return [{"type": "input_text", "text": user_text}]
+        return [{"type": "text", "text": user_text}]
 
     @staticmethod
     def build_user_content(
@@ -559,7 +559,7 @@ class InputBuilder:
         return [
             {
                 "role": "system",
-                "content": [{"type": "input_text", "text": system_prompt}],
+                "content": [{"type": "text", "text": system_prompt}],
             },
             {"role": "user", "content": user_content},
         ]
@@ -928,23 +928,25 @@ class JudgeClient:
                         cfg.cost.enabled,
                     )
 
-                    resp = self.client.responses.create(
+                    # Chat Completions structured output
+                    resp = self.client.chat.completions.create(
                         model=self.model,
-                        input=messages,
-                        text={
-                            "format": {
-                                "type": "json_schema",
+                        messages=messages,
+                        response_format={
+                            "type": "json_schema",
+                            "json_schema": {
                                 "name": schema_name,
                                 "strict": True,
                                 "schema": schema,
-                            }
+                            },
                         },
                         temperature=cfg.temperature,
-                        max_output_tokens=cfg.max_output_tokens,
+                        max_completion_tokens=cfg.max_output_tokens,
                         timeout=self.retry.timeout_s,
                     )
 
-                    payload = _safe_json_loads(resp.output_text)
+                    # 3) parsed JSON
+                    payload = _safe_json_loads(str(resp.choices[0].message.content))
                     latency_ms = (time.time() - t0) * 1000.0
                     is_err = "error" in payload
 
