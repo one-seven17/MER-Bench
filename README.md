@@ -45,6 +45,26 @@ MER-Bench is a comprehensive benchmark for multimodal meme reappraisal: transfor
 
 <br/>
 
+
+## Environment Setup
+
+Please install **uv** by following the official instructions:  
+https://docs.astral.sh/uv/getting-started/installation/
+
+After installation, run:
+
+```bash
+uv sync
+```
+
+Then activate the virtual environment:
+
+```bash
+source .venv/bin/activate
+```
+
+This will create the required environment and install all dependencies.
+
 ## Preparing the Data
 
 Please use the Hugging Face CLI to download our dataset and the pre-generated model outputs from `LeoReverse/17nie`:
