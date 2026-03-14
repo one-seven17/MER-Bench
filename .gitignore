@@ -227,7 +227,7 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Dataset
-data
+data/**/*.png
 
 # Output directories
 *outputs

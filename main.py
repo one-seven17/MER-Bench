@@ -1,36 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-main.py
-
-High-concurrency batch evaluator for meme emotion reframing.
-
-Behaviors:
-1) Uses judge.py concurrency + retry:
-   - JudgeClient: retry + in-flight semaphore
-   - JudgePipeline: ThreadPoolExecutor concurrency
-2) factor_view and model_view are mutually exclusive.
-3) visual_type / sentiment_polarity / layout_type: each can be specified with at most ONE value, or omitted.
-4) model_view: evaluates all selected stratum rows; per run samples rows then evaluates ALL models.
-5) factor_view: evaluates ONLY the specified filter-combination stratum (or all if no filters).
-   - Sampling is evenly split across models each run.
-   - Aggregation is from stratum perspective (models marginalized), report mean/std/CI over runs.
-6) Supports configurable concurrency: --sample-workers and --max-in-flight.
-7) Optional cost accumulation excludes cache hits.
-8) --dry-run: only stats + sampling plan, no judge calls.
-9) Save per-run jsonl outputs by model under:
-     output_save_dir/{exp}/{model_view|factor_view}/{model}/{run_idx}.jsonl
-   Each line records sampled row_id/gen_id and the out item from pipeline.
-10) Save final summary JSON under:
-     out_dir/{model_view|factor_view}/{filename}.json
-   where filename encodes models + factor filters + sampling.
-
-Notes:
-- This script assumes you place it next to judge.py and judge.py exports:
-  CacheConfig, ConcurrencyConfig, JudgeClient, JudgeConfig, JudgePipeline, MemeSample,
-  RetryConfig, RunConfig
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -357,7 +324,7 @@ def build_experiment_dirname(
     seed: int,
 ) -> str:
     parts: List[str] = []
-    parts.append("models=" + "+".join(models))
+    parts.append("models=" + "+".join([model[:5] for model in models]))
     parts.append(f"vt={visual_type or 'all'}")
     parts.append(f"sp={sentiment_polarity or 'all'}")
     parts.append(f"lt={layout_type or 'all'}")
@@ -382,7 +349,7 @@ def build_summary_filename(
     seed: int,
 ) -> str:
     parts: List[str] = []
-    parts.append("models=" + "+".join(models))
+    parts.append("models=" + "+".join([model[:5] for model in models]))
     parts.append(f"vt={visual_type or 'all'}")
     parts.append(f"sp={sentiment_polarity or 'all'}")
     parts.append(f"lt={layout_type or 'all'}")

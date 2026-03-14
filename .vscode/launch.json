@@ -18,6 +18,25 @@
             "cwd": "${workspaceFolder}"
         },
         {
+            "name": "RFS",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/rfs.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src",
+            },
+            "envFile": "${workspaceFolder}/.env",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "--input",
+                "experiments/perf_across_model/summaries/model_view/models=BAGEL+Dream+FLUX.+FLUX.+In-Co+LongC+Omnig+Qwen-+Step1+Z-Ima+got+instr+stabl+unipi__vt=all__sp=all__lt=all__n=100__runs=10__seed=42__ra=first__im=first.json",
+                "--out",
+                "debug.json"
+            ]
+        },
+        {
             "name": "Python: Debug Tests",
             "type": "debugpy",
             "request": "launch",

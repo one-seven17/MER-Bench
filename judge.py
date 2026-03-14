@@ -254,7 +254,7 @@ class JudgeConfig:
     # Ablation switch: images go before or after the instruction text
     images_first: bool = True
     temperature: float = 0.0
-    max_output_tokens: int = 900
+    max_output_tokens: Optional[int] = 900
     cost: CostConfig = field(default_factory=lambda: CostConfig(enabled=True))
 
 
@@ -929,7 +929,7 @@ class JudgeClient:
                     )
 
                     # Chat Completions structured output
-                    resp = self.client.chat.completions.create(
+                    with self.client.beta.chat.completions.stream(
                         model=self.model,
                         messages=messages,
                         response_format={
@@ -940,10 +940,11 @@ class JudgeClient:
                                 "schema": schema,
                             },
                         },
-                        temperature=cfg.temperature,
+                        temperature=cfg.temperature + attempt * 0.1,
                         max_completion_tokens=cfg.max_output_tokens,
                         timeout=self.retry.timeout_s,
-                    )
+                    ) as st:
+                        resp = st.get_final_completion()
 
                     # 3) parsed JSON
                     payload = _safe_json_loads(str(resp.choices[0].message.content))
