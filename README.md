@@ -16,11 +16,11 @@
 
 <p align="center">
   <strong>
-    <a target="_blank" href="https://scholar.google.com/citations?user=iqZO3L4AAAAJ&hl=en&authuser=1">Yiqi Nie</a><sup>1,2</sup> ·
+    <a target="_blank" href="https://scholar.google.com/citations?user=iqZO3L4AAAAJ&hl=en&authuser=1">Yiqi Nie</a><sup>1,3</sup> ·
     <a target="_blank" href="https://scholar.google.com/citations?user=sdqv6pQAAAAJ&hl=en&authuser=1">Fei Wang</a><sup>2,3</sup> ·
     <a target="_blank" href="https://scholar.google.com/citations?user=q3NWGzUAAAAJ&hl=en&authuser=1">Junjie Chen</a><sup>2,3</sup> ·
     <a target="_blank" href="https://scholar.google.com/citations?user=UQ_bInoAAAAJ&hl=en&authuser=1">Kun Li</a><sup>4</sup> ·
-    <a target="_blank" href="">Yudi Cai</a><sup>5</sup>
+    <a target="_blank" href="">Yudi Cai</a><sup>3,5</sup>
   </strong>
   <br/>
   <strong>
