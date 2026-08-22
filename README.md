@@ -223,3 +223,16 @@ Then compute the final aggregated metrics using the generated JSON file:
 ```bash
 python results/figure_5_o.py --input /path/to/generated-json-file --output figure_5_o.csv
 ```
+
+## Citation
+
+If you find **MER-Bench** useful for your research, please consider citing our work:
+
+```bibtex
+@inproceedings{nie2026merbench,
+  title     = {MER-Bench: A Comprehensive Benchmark for Multimodal Meme Reappraisal},
+  author    = {Nie, Yiqi and Wang, Fei and Chen, Junjie and Li, Kun and Cai, Yudi and Guo, Dan and Li, Chenglong and Wang, Meng},
+  booktitle = {Proceedings of the 2026 Conference on Empirical Methods in Natural Language Processing (EMNLP)},
+  year      = {2026}
+}
+```
