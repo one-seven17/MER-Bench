@@ -45,6 +45,9 @@ MER-Bench is a comprehensive benchmark for multimodal meme reappraisal: transfor
 
 <br/>
 
+## 📰 News
+
+* [2026.08] 🎉 Our paper MER-Bench: A Comprehensive Benchmark for Multimodal Meme Reappraisal has been accepted to EMNLP 2026!
 
 ## Environment Setup
 
