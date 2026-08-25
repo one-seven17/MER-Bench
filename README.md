@@ -5,7 +5,7 @@
 </p> -->
 
 <h1 align="center">
-  MER-Bench：A Comprehensive Benchmark for Multimodal Meme Reappraisal
+  MER-Bench: Benchmarking Multimodal Emotional Reappraisal for Image-Text Memes
 </h1>
 
 <!-- <p align="center">
